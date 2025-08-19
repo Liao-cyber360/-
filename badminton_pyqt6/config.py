@@ -4,10 +4,27 @@
 """
 import os
 import time
-import yaml
-from PyQt6.QtCore import QSettings
-from PyQt6.QtWidgets import QApplication
 import numpy as np
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+except ImportError:
+    # 如果PyQt6不可用，提供备用实现
+    class QSettings:
+        def __init__(self, *args):
+            self._data = {}
+        
+        def value(self, key, default, type=None):
+            return self._data.get(key, default)
+        
+        def setValue(self, key, value):
+            self._data[key] = value
 
 
 class Config:

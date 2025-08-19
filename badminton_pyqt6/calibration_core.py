@@ -7,7 +7,10 @@ import numpy as np
 import os
 import time
 from ultralytics import YOLO
-from .config import config
+try:
+    from .config import config
+except ImportError:
+    from config import config
 
 
 class CalibrationCore:

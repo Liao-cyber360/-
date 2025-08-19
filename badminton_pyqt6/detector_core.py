@@ -7,7 +7,10 @@ import numpy as np
 from ultralytics import YOLO
 from collections import deque
 import time
-from .config import config
+try:
+    from .config import config
+except ImportError:
+    from config import config
 
 
 class LandingDetector:

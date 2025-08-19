@@ -7,7 +7,10 @@ import cv2
 from filterpy.kalman import ExtendedKalmanFilter
 import time
 from scipy.optimize import minimize
-from .config import config
+try:
+    from .config import config
+except ImportError:
+    from config import config
 
 
 class ExtendedKalmanFilterPredictor:
