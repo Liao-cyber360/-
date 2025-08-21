@@ -38,12 +38,12 @@ class Config:
     def _load_default_config(self):
         """加载默认配置"""
         # 相机参数
-        self.camera_params_file_1 = self.get_setting("camera/params_file_1", "")
-        self.camera_params_file_2 = self.get_setting("camera/params_file_2", "")
+        self.camera_params_file_1 = self.get_setting("E:\hawkeye\calibration\calibration_results_2025-08-11_18-06-15.yaml", "")
+        self.camera_params_file_2 = self.get_setting("E:\hawkeye\calibration\calibration_results_2025-08-11_18-06-15.yaml", "")
         
         # 模型参数
-        self.yolo_ball_model = self.get_setting("models/yolo_ball", "")
-        self.yolo_court_model = self.get_setting("models/yolo_court", "")
+        self.yolo_ball_model = self.get_setting("E:\\hawkeye\\ball\\best.pt", "")
+        self.yolo_court_model = self.get_setting("E:\\hawkeye\\field\\best.pt", "")
         
         # 视频参数
         self.video_width = self.get_setting("video/width", 1280)
@@ -57,7 +57,7 @@ class Config:
         self.poly_fit_degree = self.get_setting("analysis/poly_fit_degree", 4)
         
         # 物理模型参数
-        self.shuttlecock_mass = self.get_setting("physics/mass", 0.005)
+        self.shuttlecock_mass = self.get_setting("physics/mass", 0.0048)
         self.shuttlecock_radius = self.get_setting("physics/radius", 0.025)
         self.air_density = self.get_setting("physics/air_density", 1.225)
         self.drag_coefficient = self.get_setting("physics/drag_coefficient", 0.6)

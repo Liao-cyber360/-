@@ -6,8 +6,8 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QTimer
 from collections import deque
-from .predictor_core import TrajectoryPredictor, CourtBoundaryAnalyzer
-from .config import config
+from predictor_core import TrajectoryPredictor, CourtBoundaryAnalyzer
+from config import config
 
 
 class PredictionWorker(QThread):

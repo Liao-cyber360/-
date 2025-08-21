@@ -2,6 +2,7 @@
 标定窗口
 QDialog模态窗口，支持图像显示和点选交互
 """
+import time  # 先导入模块
 import cv2
 import numpy as np
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -12,8 +13,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                             QMessageBox, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QRectF, QPointF, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont
-from .calibration_core import CalibrationCore
-from .config import config
+from calibration_core import CalibrationCore
+from config import config
 
 
 class InteractiveImageView(QGraphicsView):

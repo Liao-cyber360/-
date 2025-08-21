@@ -8,7 +8,7 @@ from filterpy.kalman import ExtendedKalmanFilter
 import time
 from scipy.optimize import minimize
 try:
-    from .config import config
+    from config import config
 except ImportError:
     from config import config
 

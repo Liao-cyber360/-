@@ -13,16 +13,16 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 import time
 
 # 导入自定义组件
-from .video_widget import DualVideoWidget
-from .control_panel import ControlPanel
-from .calibration_window import CalibrationWindow
-from .visualization_3d import Visualization3DWidget, CourtVisualizationWidget
-from .video_worker import DualVideoWorker
-from .detection_worker import DetectionWorker, StereoDetectionWorker
-from .prediction_worker import PredictionWorker
-from .config import config
-from .utils import logger, SystemUtils, DialogUtils
-from .styles import MAIN_STYLE, DARK_THEME
+from video_widget import DualVideoWidget
+from control_panel import ControlPanel
+from calibration_window import CalibrationWindow
+from visualization_3d import Visualization3DWidget, CourtVisualizationWidget
+from video_worker import DualVideoWorker
+from detection_worker import DetectionWorker, StereoDetectionWorker
+from prediction_worker import PredictionWorker
+from config import config
+from utils import logger, SystemUtils, DialogUtils
+from styles import MAIN_STYLE, DARK_THEME
 
 
 class MainWindow(QMainWindow):
@@ -241,8 +241,8 @@ class MainWindow(QMainWindow):
         reset_action.triggered.connect(self.reset_trajectory)
         processing_menu.addAction(reset_action)
         
-        # 视图菜单\n        view_menu = menubar.addMenu("View")
-        
+        # 视图菜单\n
+        view_menu = menubar.addMenu("View")
         # 主题切换
         theme_menu = view_menu.addMenu("Theme")
         
