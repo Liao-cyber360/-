@@ -7,7 +7,7 @@ import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QMenuBar, QMenu, QStatusBar, QSplitter, QLabel,
                             QFileDialog, QMessageBox, QApplication, QToolBar,
-                            QProgressBar, QFrame, QDockWidget)
+                            QProgressBar, QFrame, QDockWidget, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QSettings
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 import time
@@ -16,10 +16,11 @@ import time
 from .video_widget import DualVideoWidget
 from .control_panel import ControlPanel
 from .calibration_window import CalibrationWindow
-from .visualization_3d import Visualization3DWidget, CourtVisualizationWidget
+from .visualization_3d import Visualization3DWidget
 from .video_worker import DualVideoWorker
 from .detection_worker import DetectionWorker, StereoDetectionWorker
 from .prediction_worker import PredictionWorker
+from .speed_detector import SpeedDetector
 from .config import config
 from .utils import logger, SystemUtils, DialogUtils
 from .styles import MAIN_STYLE, DARK_THEME
@@ -41,12 +42,14 @@ class MainWindow(QMainWindow):
         self.detection_worker2 = None
         self.stereo_worker = None
         self.prediction_worker = None
+        self.speed_detector = SpeedDetector()
         
         # 状态
         self.system_initialized = False
         self.calibration_completed = False
         self.video_loaded = False
         self.processing_active = False
+        self.is_paused = False
         
         # 性能监控
         self.performance_timer = QTimer()
@@ -72,68 +75,152 @@ class MainWindow(QMainWindow):
         logger.info("Main window initialized")
     
     def setup_ui(self):
-        """设置主界面"""
+        """设置主界面 - 改进的多窗口多标签页设计"""
         # 中央窗口
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 主布局
-        main_layout = QHBoxLayout(central_widget)
+        # 主布局 - 使用标签页设计
+        main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
         
-        # 创建分割器
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # 创建标签页管理器
+        from PyQt6.QtWidgets import QTabWidget
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
         
-        # 左侧：视频显示区域
-        self.setup_video_area(main_splitter)
+        # 主监控标签页
+        self.setup_main_tab()
         
-        # 右侧：3D可视化区域
-        self.setup_visualization_area(main_splitter)
+        # 标定标签页
+        self.setup_calibration_tab()
         
-        # 设置分割器比例
-        main_splitter.setSizes([900, 500])
-        main_layout.addWidget(main_splitter)
+        # 分析标签页
+        self.setup_analysis_tab()
         
         # 创建停靠面板
         self.setup_dock_widgets()
     
+    def setup_main_tab(self):
+        """设置主监控标签页"""
+        main_tab = QWidget()
+        layout = QHBoxLayout(main_tab)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(10)
+        
+        # 创建分割器 - 调整比例为4:3视频
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧：视频显示区域 (4:3比例)
+        self.setup_video_area(main_splitter)
+        
+        # 右侧：3D可视化区域 (更大空间)
+        self.setup_visualization_area(main_splitter)
+        
+        # 设置分割器比例 - 给3D可视化更多空间
+        main_splitter.setSizes([800, 700])
+        layout.addWidget(main_splitter)
+        
+        self.tab_widget.addTab(main_tab, "主监控")
+    
+    def setup_calibration_tab(self):
+        """设置标定标签页"""
+        calibration_tab = QWidget()
+        layout = QVBoxLayout(calibration_tab)
+        
+        # 标定控制面板
+        calibration_label = QLabel("相机标定与配置")
+        calibration_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
+        layout.addWidget(calibration_label)
+        
+        # 这里可以添加标定相关的控件
+        placeholder = QLabel("标定功能将在这里实现\n支持本地视频和摄像头的多帧YOLO角点检测")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("background-color: #f0f0f0; padding: 20px; border-radius: 5px;")
+        layout.addWidget(placeholder)
+        
+        self.tab_widget.addTab(calibration_tab, "相机标定")
+    
+    def setup_analysis_tab(self):
+        """设置分析标签页"""
+        analysis_tab = QWidget()
+        layout = QVBoxLayout(analysis_tab)
+        
+        # 分析控制面板
+        analysis_label = QLabel("轨迹分析与速度检测")
+        analysis_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
+        layout.addWidget(analysis_label)
+        
+        # 这里可以添加分析相关的控件
+        placeholder = QLabel("分析功能将在这里实现\n包括最大速度检测和轨迹预测分析")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("background-color: #f0f0f0; padding: 20px; border-radius: 5px;")
+        layout.addWidget(placeholder)
+        
+        self.tab_widget.addTab(analysis_tab, "轨迹分析")
+    
     def setup_video_area(self, parent):
-        """设置视频显示区域"""
+        """设置视频显示区域 - 4:3比例优化"""
         # 视频区域容器
         video_frame = QFrame()
         video_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         video_layout = QVBoxLayout(video_frame)
         video_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 视频显示组件
+        # 视频标题
+        video_title = QLabel("双路视频监控 (4:3)")
+        video_title.setStyleSheet("font-weight: bold; padding: 5px;")
+        video_layout.addWidget(video_title)
+        
+        # 视频显示组件 - 设置为4:3比例
         self.video_widget = DualVideoWidget()
+        # 设置固定的4:3比例 (640x480 * 2 + 间距)
+        self.video_widget.setMinimumSize(1300, 500)
         video_layout.addWidget(self.video_widget)
+        
+        # 控制按钮区域
+        control_frame = QFrame()
+        control_layout = QHBoxLayout(control_frame)
+        
+        # 暂停按钮
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.clicked.connect(self.on_pause_clicked)
+        control_layout.addWidget(self.pause_btn)
+        
+        # 预测按钮 - 仅在暂停后可用
+        self.predict_btn = QPushButton("开始预测")
+        self.predict_btn.setEnabled(False)
+        self.predict_btn.clicked.connect(self.on_predict_clicked)
+        control_layout.addWidget(self.predict_btn)
+        
+        # 速度检测按钮
+        self.speed_detect_btn = QPushButton("速度检测")
+        self.speed_detect_btn.setEnabled(False)
+        self.speed_detect_btn.clicked.connect(self.on_speed_detect_clicked)
+        control_layout.addWidget(self.speed_detect_btn)
+        
+        control_layout.addStretch()
+        video_layout.addWidget(control_frame)
         
         parent.addWidget(video_frame)
     
     def setup_visualization_area(self, parent):
-        """设置可视化区域"""
+        """设置可视化区域 - 仅3D可视化，更大空间"""
         # 可视化区域容器
         viz_frame = QFrame()
         viz_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         viz_layout = QVBoxLayout(viz_frame)
         viz_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 创建可视化选项卡分割器
-        viz_splitter = QSplitter(Qt.Orientation.Vertical)
+        # 可视化标题
+        viz_title = QLabel("3D轨迹可视化")
+        viz_title.setStyleSheet("font-weight: bold; padding: 5px;")
+        viz_layout.addWidget(viz_title)
         
-        # 3D可视化
+        # 3D可视化 - 占用全部空间
         self.viz_3d_widget = Visualization3DWidget()
-        viz_splitter.addWidget(self.viz_3d_widget)
-        
-        # 2D场地可视化
-        self.court_viz_widget = CourtVisualizationWidget()
-        viz_splitter.addWidget(self.court_viz_widget)
-        
-        # 设置分割器比例
-        viz_splitter.setSizes([400, 200])
-        viz_layout.addWidget(viz_splitter)
+        viz_layout.addWidget(self.viz_3d_widget)
         
         parent.addWidget(viz_frame)
     
@@ -592,14 +679,85 @@ class MainWindow(QMainWindow):
         # 更新3D可视化
         self.viz_3d_widget.update_trajectory(trajectory_3d)
         
-        # 更新2D可视化
-        self.court_viz_widget.update_trajectory_2d(trajectory_3d)
-        
         # 更新控制面板状态
         quality = trajectory_data.get('quality', 0)
         self.control_panel.update_status(
             trajectory_status=(len(trajectory_3d), len(trajectory_3d), quality)
         )
+    
+    def on_pause_clicked(self):
+        """暂停按钮点击处理"""
+        if self.video_worker:
+            self.video_worker.pause()
+            self.is_paused = True
+            self.pause_btn.setText("播放")
+            
+            # 启用预测和速度检测按钮
+            self.predict_btn.setEnabled(True)
+            self.speed_detect_btn.setEnabled(True)
+            
+            self.statusBar().showMessage("视频已暂停，可以开始预测")
+        else:
+            self.video_worker.play()
+            self.is_paused = False
+            self.pause_btn.setText("暂停")
+            
+            # 禁用预测和速度检测按钮
+            self.predict_btn.setEnabled(False)
+            self.speed_detect_btn.setEnabled(False)
+    
+    def on_predict_clicked(self):
+        """预测按钮点击处理"""
+        if not self.is_paused:
+            DialogUtils.show_warning(self, "警告", "请先暂停视频再进行预测")
+            return
+            
+        if self.video_worker:
+            # 触发预测处理
+            self.video_worker.trigger_prediction()
+            self.statusBar().showMessage("正在进行轨迹预测...")
+    
+    def on_speed_detect_clicked(self):
+        """速度检测按钮点击处理"""
+        if not self.is_paused:
+            DialogUtils.show_warning(self, "警告", "请先暂停视频再进行速度检测")
+            return
+            
+        try:
+            # 获取3D轨迹数据
+            if self.stereo_worker:
+                trajectory_data = self.stereo_worker.get_trajectory_data()
+                trajectory_3d = trajectory_data.get('trajectory_3d', [])
+                timestamps = trajectory_data.get('timestamps', [])
+                
+                if len(trajectory_3d) < 5:
+                    DialogUtils.show_warning(self, "警告", "轨迹数据不足，需要至少5个点")
+                    return
+                
+                # 进行速度检测
+                result = self.speed_detector.detect_max_speed_before_landing(trajectory_3d, timestamps)
+                
+                if result:
+                    # 显示速度检测结果
+                    max_speed = result['max_speed']
+                    max_speed_kmh = result['max_speed_kmh']
+                    time_to_landing = result['time_to_landing']
+                    
+                    message = f"最大速度检测结果:\n"
+                    message += f"最大速度: {max_speed:.1f} cm/s ({max_speed_kmh:.1f} km/h)\n"
+                    message += f"距落地时间: {time_to_landing:.2f} 秒\n"
+                    message += f"轨迹点数: {result['trajectory_length']}"
+                    
+                    DialogUtils.show_info(self, "速度检测结果", message)
+                    self.statusBar().showMessage(f"最大速度: {max_speed_kmh:.1f} km/h")
+                else:
+                    DialogUtils.show_error(self, "错误", "速度检测失败")
+            else:
+                DialogUtils.show_warning(self, "警告", "立体视觉系统未初始化")
+                
+        except Exception as e:
+            logger.error(f"Speed detection failed: {e}")
+            DialogUtils.show_error(self, "错误", f"速度检测失败: {e}")
     
     def on_prediction_ready(self, result):
         """预测结果就绪"""
@@ -616,9 +774,6 @@ class MainWindow(QMainWindow):
                 
                 # 更新3D可视化
                 self.viz_3d_widget.update_prediction(trajectory, landing_point)
-                
-                # 更新2D可视化
-                self.court_viz_widget.update_prediction_2d(trajectory, landing_point)
                 
                 # 更新控制面板状态
                 in_bounds = None

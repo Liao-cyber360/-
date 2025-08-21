@@ -28,7 +28,7 @@ class VideoDisplayWidget(QWidget):
         self.setup_ui()
     
     def setup_ui(self):
-        """设置界面"""
+        """设置界面 - 4:3比例优化"""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
@@ -48,36 +48,30 @@ class VideoDisplayWidget(QWidget):
         """)
         layout.addWidget(self.title_label)
         
-        # 视频显示区域
+        # 视频显示区域 - 保持4:3比例
         self.video_label = QLabel()
-        self.video_label.setMinimumSize(320, 240)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setMinimumSize(640, 480)  # 4:3比例
+        self.video_label.setMaximumSize(960, 720)  # 最大尺寸保持4:3
+        self.video_label.setScaledContents(False)  # 不自动缩放，保持比例
         self.video_label.setStyleSheet("""
             QLabel {
                 background-color: #000;
-                border: 2px solid #ccc;
+                border: 1px solid #ccc;
                 border-radius: 5px;
             }
         """)
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setText("No Video")
+        self.video_label.setText("No Video Signal\n等待视频信号...")
         self.video_label.mousePressEvent = self.on_frame_clicked
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.video_label)
         
         # 状态信息
         self.status_label = QLabel("Ready")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet("""
-            QLabel {
-                color: #666;
-                font-size: 11px;
-                padding: 2px;
-            }
-        """)
+        self.status_label.setStyleSheet("color: #666; font-size: 12px;")
         layout.addWidget(self.status_label)
-    
     def update_frame(self, frame):
-        """更新显示帧"""
+        """更新显示帧 - 保持4:3比例"""
         if frame is None:
             return
         
@@ -95,19 +89,26 @@ class VideoDisplayWidget(QWidget):
         
         qt_image = QImage(frame_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
         
-        # 缩放到适合的大小
+        # 缩放图像以适应标签尺寸，保持4:3比例
         label_size = self.video_label.size()
-        if label_size.width() > 0 and label_size.height() > 0:
-            scaled_image = qt_image.scaled(
-                label_size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            pixmap = QPixmap.fromImage(scaled_image)
-            self.video_label.setPixmap(pixmap)
+        target_width = label_size.width()
+        target_height = int(target_width * 3 / 4)  # 保持4:3比例
+        
+        # 如果计算出的高度超过标签高度，则以高度为准
+        if target_height > label_size.height():
+            target_height = label_size.height()
+            target_width = int(target_height * 4 / 3)
+        
+        scaled_pixmap = QPixmap.fromImage(qt_image).scaled(
+            target_width, target_height, 
+            Qt.AspectRatioMode.KeepAspectRatio, 
+            Qt.TransformationMode.SmoothTransformation
+        )
+        
+        self.video_label.setPixmap(scaled_pixmap)
         
         # 更新状态
-        self.status_label.setText(f"Frame: {width}x{height}")
+        self.status_label.setText(f"{width}x{height} | Camera {self.camera_id}")
     
     def on_frame_clicked(self, event):
         """处理帧点击事件"""
