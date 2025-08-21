@@ -1,17 +1,18 @@
 """
-视频处理线程 - 简化版本
-负责视频帧读取和缓冲，支持网络摄像头，5秒缓冲，暂停-预测工作流
+视频处理线程
+负责视频帧读取和缓冲，支持网络摄像头
 """
 import cv2
 import time
 import numpy as np
 import requests
+import re
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 from collections import deque
 
 
 class VideoWorker(QThread):
-    """视频处理工作线程 - 简化版本"""
+    """视频处理工作线程"""
     
     # 信号定义
     frame_ready = pyqtSignal(int, np.ndarray, float)  # (camera_id, frame, timestamp)
@@ -39,12 +40,13 @@ class VideoWorker(QThread):
         # 网络摄像头支持
         self.is_network_camera = False
         self.network_session = None
+        self.last_timestamp_header = None
         
         # 线程同步
         self.mutex = QMutex()
         self.condition = QWaitCondition()
         
-        # 5秒帧缓冲
+        # 帧缓冲 - 改为5秒缓冲
         self.buffer_duration = 5.0  # 5秒缓冲
         self.frame_buffer = deque()
         self.timestamp_buffer = deque()
@@ -52,6 +54,7 @@ class VideoWorker(QThread):
         # 性能统计
         self.frame_count = 0
         self.start_time = 0
+        self.last_fps_update = 0
         self.actual_fps = 0
     
     def set_video_source(self, source):
@@ -99,11 +102,19 @@ class VideoWorker(QThread):
                     # 网络摄像头
                     self.is_network_camera = True
                     self.network_session = requests.Session()
-                    self.cap = cv2.VideoCapture(self.video_source)
+                    
+                    # 尝试连接网络摄像头
+                    if self.video_source.startswith(('http://', 'https://')):
+                        # HTTP流
+                        self.cap = cv2.VideoCapture(self.video_source)
+                    else:
+                        # RTSP/RTMP流
+                        self.cap = cv2.VideoCapture(self.video_source)
                     
                     if not self.cap.isOpened():
                         raise ValueError(f"Cannot open network camera: {self.video_source}")
                     
+                    # 网络摄像头参数
                     self.total_frames = 0
                     self.fps = 30.0
                     
@@ -114,6 +125,7 @@ class VideoWorker(QThread):
                     if not self.cap.isOpened():
                         raise ValueError(f"Cannot open video file: {self.video_source}")
                     
+                    # 获取视频信息
                     self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
                 
@@ -129,7 +141,7 @@ class VideoWorker(QThread):
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
                 
-                self.total_frames = 0
+                self.total_frames = 0  # 实时摄像头没有总帧数
                 self.fps = 30.0
             
             else:
@@ -152,8 +164,9 @@ class VideoWorker(QThread):
             return None
         
         try:
+            # 对于HTTP流，尝试获取头信息
             if self.video_source.startswith(('http://', 'https://')):
-                response = self.network_session.head(self.video_source, timeout=0.1)
+                response = self.network_session.head(self.video_source, timeout=1)
                 x_timestamp = response.headers.get('X-Timestamp')
                 if x_timestamp:
                     return float(x_timestamp)
@@ -228,18 +241,25 @@ class VideoWorker(QThread):
                         # 发送帧数据
                         self.frame_ready.emit(self.camera_id, frame, timestamp)
                         
+                        # 更新FPS统计
+                        self.update_fps_stats()
+                        
                         # 控制帧率
-                        if isinstance(self.video_source, str) and not self.is_network_camera:
+                        if isinstance(self.video_source, str):
+                            # 文件播放需要控制帧率
                             time.sleep(1.0 / self.fps)
                         else:
-                            time.sleep(0.01)  # 网络摄像头和本地摄像头稍微延迟
+                            # 实时摄像头，稍微延迟避免过于频繁
+                            time.sleep(0.001)
                     
                     else:
                         # 文件结束或读取错误
-                        if isinstance(self.video_source, str) and not self.is_network_camera:
+                        if isinstance(self.video_source, str):
+                            # 视频文件播放完毕
                             self.status_changed.emit(self.camera_id, "Completed")
                             break
                         else:
+                            # 摄像头读取错误
                             self.error_occurred.emit(f"Camera {self.camera_id} read error")
                             break
                 
@@ -255,15 +275,33 @@ class VideoWorker(QThread):
             if self.cap:
                 self.cap.release()
                 self.cap = None
-            if self.network_session:
-                self.network_session.close()
             self.status_changed.emit(self.camera_id, "Disconnected")
+    
+    def update_fps_stats(self):
+        """更新FPS统计"""
+        current_time = time.time()
+        
+        if current_time - self.last_fps_update >= 1.0:  # 每秒更新一次
+            elapsed = current_time - self.start_time
+            if elapsed > 0:
+                self.actual_fps = self.frame_count / elapsed
+            self.last_fps_update = current_time
+    
+    def get_current_frame_info(self):
+        """获取当前帧信息"""
+        return {
+            'current_frame': self.current_frame,
+            'total_frames': self.total_frames,
+            'fps': self.fps,
+            'actual_fps': self.actual_fps
+        }
 
 
 class DualVideoWorker(QThread):
-    """双路视频处理工作线程 - 简化版本，支持暂停-预测工作流"""
+    """双路视频同步处理工作线程 - 简化版本，支持5秒缓冲"""
     
     # 信号定义
+    frames_ready = pyqtSignal(np.ndarray, np.ndarray, float)  # (frame1, frame2, timestamp)
     frame_ready = pyqtSignal(int, np.ndarray, float)  # (camera_id, frame, timestamp)
     error_occurred = pyqtSignal(str)
     status_changed = pyqtSignal(str)
@@ -282,14 +320,16 @@ class DualVideoWorker(QThread):
         # 状态控制
         self.is_running = False
         self.is_paused = False
+        self.prediction_mode = False  # 预测模式
         
+        # 简化同步 - 不再进行复杂的实时同步
         self.setup_connections()
     
     def setup_connections(self):
         """设置信号连接"""
         # 子线程帧信号
-        self.worker1.frame_ready.connect(self.on_frame_ready)
-        self.worker2.frame_ready.connect(self.on_frame_ready)
+        self.worker1.frame_ready.connect(self.on_frame1_ready)
+        self.worker2.frame_ready.connect(self.on_frame2_ready)
         
         # 错误信号
         self.worker1.error_occurred.connect(self.error_occurred.emit)
@@ -320,13 +360,12 @@ class DualVideoWorker(QThread):
         self.worker2.stop()
         
         # 等待线程结束
-        self.worker1.wait(3000)
+        self.worker1.wait(3000)  # 最多等待3秒
         self.worker2.wait(3000)
         self.wait(1000)
     
     def play(self):
         """播放"""
-        self.is_paused = False
         self.worker1.play()
         self.worker2.play()
     
@@ -354,15 +393,120 @@ class DualVideoWorker(QThread):
         self.worker1.seek(frame_number)
         self.worker2.seek(frame_number)
     
-    def on_frame_ready(self, camera_id, frame, timestamp):
-        """帧就绪 - 直接转发"""
+    def on_frame1_ready(self, camera_id, frame, timestamp):
+        """相机1帧就绪 - 简化版本，直接转发"""
         self.frame_ready.emit(camera_id, frame, timestamp)
+    
+    def on_frame2_ready(self, camera_id, frame, timestamp):
+        """相机2帧就绪 - 简化版本，直接转发"""
+        self.frame_ready.emit(camera_id, frame, timestamp)
+    
+    def try_sync_frames(self):
+        """尝试同步帧"""
+        if not self.sync_enabled or len(self.buffer1) == 0 or len(self.buffer2) == 0:
+            return
+        
+        # 寻找时间戳最接近的帧对
+        best_match = None
+        min_time_diff = float('inf')
+        
+        for i, (frame1, ts1) in enumerate(self.buffer1):
+            for j, (frame2, ts2) in enumerate(self.buffer2):
+                time_diff = abs(ts1 - ts2)
+                if time_diff < min_time_diff:
+                    min_time_diff = time_diff
+                    best_match = (i, j, frame1, frame2, ts1, ts2)
+        
+        if best_match and min_time_diff <= self.sync_threshold:
+            i, j, frame1, frame2, ts1, ts2 = best_match
+            
+            # 移除已使用的帧
+            self.remove_used_frames(i, j)
+            
+            # 发送同步帧
+            avg_timestamp = (ts1 + ts2) / 2
+            self.frames_ready.emit(frame1, frame2, avg_timestamp)
+            
+            # 更新同步状态
+            self.total_frames += 1
+            self.sync_status.emit(True, min_time_diff)
+        
+        elif min_time_diff > self.sync_threshold:
+            # 同步失败
+            self.sync_errors += 1
+            self.sync_status.emit(False, min_time_diff)
+            
+            # 清理过旧的帧
+            self.cleanup_old_frames()
+    
+    def remove_used_frames(self, index1, index2):
+        """移除已使用的帧"""
+        # 移除已匹配的帧以及之前的帧
+        for _ in range(index1 + 1):
+            if self.buffer1:
+                self.buffer1.popleft()
+        
+        for _ in range(index2 + 1):
+            if self.buffer2:
+                self.buffer2.popleft()
+    
+    def cleanup_old_frames(self):
+        """清理过旧的帧"""
+        current_time = time.time()
+        max_age = 0.1  # 100ms
+        
+        # 清理buffer1中的旧帧
+        while self.buffer1:
+            _, timestamp = self.buffer1[0]
+            if current_time - timestamp > max_age:
+                self.buffer1.popleft()
+            else:
+                break
+        
+        # 清理buffer2中的旧帧
+        while self.buffer2:
+            _, timestamp = self.buffer2[0]
+            if current_time - timestamp > max_age:
+                self.buffer2.popleft()
+            else:
+                break
     
     def on_status_changed(self, camera_id, status):
         """处理状态变化"""
-        self.status_changed.emit(f"Camera {camera_id}: {status}")
+        if camera_id == 0:
+            status1 = status
+            status2 = "Unknown"
+        else:
+            status1 = "Unknown"
+            status2 = status
+        
+        combined_status = f"Cam1: {status1}, Cam2: {status2}"
+        self.status_changed.emit(combined_status)
+    
+    def set_sync_enabled(self, enabled):
+        """设置是否启用同步"""
+        self.sync_enabled = enabled
+    
+    def set_sync_threshold(self, threshold):
+        """设置同步阈值"""
+        self.sync_threshold = threshold
+    
+    def get_sync_stats(self):
+        """获取同步统计信息"""
+        sync_rate = 0
+        if self.total_frames > 0:
+            sync_rate = (self.total_frames - self.sync_errors) / self.total_frames
+        
+        return {
+            'total_frames': self.total_frames,
+            'sync_errors': self.sync_errors,
+            'sync_rate': sync_rate,
+            'buffer1_size': len(self.buffer1),
+            'buffer2_size': len(self.buffer2)
+        }
     
     def run(self):
-        """主线程运行"""
+        """主线程运行（监控和维护）"""
         while self.is_running:
-            time.sleep(0.1)
+            self.cleanup_old_frames()
+            self.msleep(100)  # 每100ms清理一次
