@@ -1507,3 +1507,38 @@ Developed with PyQt6, OpenCV, YOLO, and Open3D.
         )
         if file_path:
             self.yolo_model_path_edit.setText(file_path)
+
+    def get_current_video_frames(self):
+        """获取当前视频帧用于标定"""
+        if not self.video_worker:
+            return None, None
+        
+        try:
+            # 从video worker获取当前帧
+            if hasattr(self.video_worker, 'worker1') and hasattr(self.video_worker, 'worker2'):
+                frames1, timestamps1 = self.video_worker.worker1.get_buffered_frames()
+                frames2, timestamps2 = self.video_worker.worker2.get_buffered_frames()
+                
+                if frames1 and frames2:
+                    # 返回最新的帧（原画质量）
+                    return frames1[-1], frames2[-1]
+        except Exception as e:
+            logger.error(f"Failed to get video frames: {e}")
+        
+        return None, None
+
+    def get_video_frame_buffer(self):
+        """获取视频帧缓冲区用于标定帧选择"""
+        if not self.video_worker:
+            return [], []
+        
+        try:
+            # 从video worker获取缓冲帧
+            if hasattr(self.video_worker, 'worker1') and hasattr(self.video_worker, 'worker2'):
+                frames1, timestamps1 = self.video_worker.worker1.get_buffered_frames()
+                frames2, timestamps2 = self.video_worker.worker2.get_buffered_frames()
+                return frames1, frames2
+        except Exception as e:
+            logger.error(f"Failed to get frame buffer: {e}")
+        
+        return [], []
