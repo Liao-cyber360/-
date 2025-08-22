@@ -38,12 +38,12 @@ class Config:
     def _load_default_config(self):
         """加载默认配置"""
         # 相机参数
-        self.camera_params_file_1 = self.get_setting("camera/params_file_1", "")
-        self.camera_params_file_2 = self.get_setting("camera/params_file_2", "")
+        self.camera_params_file_1 = self.get_setting("E:\hawkeye\calibration\calibration_results_2025-08-11_18-06-15.yaml", "")
+        self.camera_params_file_2 = self.get_setting("E:\hawkeye\calibration\calibration_results_2025-08-11_18-06-15.yaml", "")
         
         # 模型参数
-        self.yolo_ball_model = self.get_setting("models/yolo_ball", "")
-        self.yolo_court_model = self.get_setting("models/yolo_court", "")
+        self.yolo_ball_model = self.get_setting("E:\\hawkeye\\ball\\best.pt", "")
+        self.yolo_court_model = self.get_setting("E:\\hawkeye\\field\\best.pt", "")
         
         # 视频参数
         self.video_width = self.get_setting("video/width", 1280)
@@ -105,9 +105,11 @@ class Config:
         if 'models' in user_config:
             self.yolo_ball_model = user_config['models'].get('yolo_ball', self.yolo_ball_model)
             self.yolo_court_model = user_config['models'].get('yolo_court', self.yolo_court_model)
-    
+
     def get_setting(self, key, default_value):
         """获取设置值"""
+        if default_value is None:
+            return self.settings.value(key, default_value)
         return self.settings.value(key, default_value, type=type(default_value))
     
     def set_setting(self, key, value):

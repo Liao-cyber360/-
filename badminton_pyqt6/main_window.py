@@ -13,17 +13,17 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 import time
 
 # 导入自定义组件
-from .video_widget import DualVideoWidget
-from .control_panel import ControlPanel
-from .calibration_window import CalibrationWindow
-from .visualization_3d import Visualization3DWidget
-from .video_worker import DualVideoWorker
-from .detection_worker import DetectionWorker, StereoDetectionWorker
-from .prediction_worker import PredictionWorker
-from .speed_detector import SpeedDetector
-from .config import config
-from .utils import logger, SystemUtils, DialogUtils
-from .styles import MAIN_STYLE, DARK_THEME
+from video_widget import DualVideoWidget
+from control_panel import ControlPanel
+from calibration_window import CalibrationWindow
+from visualization_3d import Visualization3DWidget
+from video_worker import DualVideoWorker
+from detection_worker import DetectionWorker, StereoDetectionWorker
+from prediction_worker import PredictionWorker
+from speed_detector import SpeedDetector
+from config import config
+from utils import logger, SystemUtils, DialogUtils
+from styles import MAIN_STYLE, DARK_THEME
 
 
 class MainWindow(QMainWindow):
@@ -328,7 +328,8 @@ class MainWindow(QMainWindow):
         reset_action.triggered.connect(self.reset_trajectory)
         processing_menu.addAction(reset_action)
         
-        # 视图菜单\n        view_menu = menubar.addMenu("View")
+        # 视图菜单\n
+        view_menu = menubar.addMenu("View")
         
         # 主题切换
         theme_menu = view_menu.addMenu("Theme")
@@ -404,22 +405,26 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.progress_bar.setMaximumWidth(200)
         self.statusBar().addPermanentWidget(self.progress_bar)
-    
+
     def setup_connections(self):
-        """设置信号连接"""
+        """设置信号连接 - 确保所有信号都被正确处理"""
         # 视频组件
-        self.video_widget.play_pause_clicked.connect(self.toggle_video_playback)
-        self.video_widget.stop_clicked.connect(self.stop_processing)
-        self.video_widget.seek_requested.connect(self.seek_video)
-        self.video_widget.frame1_clicked.connect(self.on_frame_clicked)
-        self.video_widget.frame2_clicked.connect(self.on_frame_clicked)
-        
+        if hasattr(self, 'video_widget'):
+            self.video_widget.play_pause_clicked.connect(self.toggle_video_playback)
+            self.video_widget.stop_clicked.connect(self.stop_processing)
+            self.video_widget.seek_requested.connect(self.seek_video)
+            self.video_widget.frame1_clicked.connect(self.on_frame_clicked)
+            self.video_widget.frame2_clicked.connect(self.on_frame_clicked)
+
         # 控制面板
         self.control_panel.parameter_changed.connect(self.on_parameter_changed)
         self.control_panel.start_calibration.connect(self.open_calibration_window)
         self.control_panel.start_prediction.connect(self.predict_landing)
         self.control_panel.reset_trajectory.connect(self.reset_trajectory)
-    
+
+        # 调试：打印所有连接
+        print("Signal connections setup completed")
+
     def initialize_workers(self):
         """初始化工作线程"""
         try:
@@ -429,58 +434,61 @@ class MainWindow(QMainWindow):
             self.prediction_worker.error_occurred.connect(self.on_worker_error)
             self.prediction_worker.status_changed.connect(self.on_prediction_status_changed)
             self.prediction_worker.start()
-            
+
             # 双目检测工作线程
             self.stereo_worker = StereoDetectionWorker()
             self.stereo_worker.stereo_result.connect(self.on_stereo_result)
             self.stereo_worker.trajectory_3d_updated.connect(self.on_trajectory_3d_updated)
             self.stereo_worker.error_occurred.connect(self.on_worker_error)
             self.stereo_worker.start()
-            
+
             logger.info("Worker threads initialized")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize workers: {e}")
-            DialogUtils.show_error(self, "Initialization Error", 
-                                 f"Failed to initialize worker threads: {e}")
-    
+
     def open_video_files(self):
-        """打开视频文件"""
+        """打开视频文件 - 添加调试信息"""
         try:
             file_dialog = QFileDialog()
             file_paths, _ = file_dialog.getOpenFileNames(
                 self, "Select Video Files", "",
                 "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv)"
             )
-            
+
+            print(f"Selected files: {file_paths}")  # 调试输出
+
             if len(file_paths) >= 2:
+                # 检查文件是否存在
+                for path in file_paths[:2]:
+                    if not os.path.exists(path):
+                        print(f"File not found: {path}")
+                        DialogUtils.show_error(self, "Error", f"File not found: {path}")
+                        return
+
                 # 创建双路视频工作线程
                 self.video_worker = DualVideoWorker(file_paths[0], file_paths[1])
-                
+
                 # 连接信号
                 self.video_worker.frames_ready.connect(self.on_frames_ready)
                 self.video_worker.frame_ready.connect(self.on_single_frame_ready)
                 self.video_worker.error_occurred.connect(self.on_worker_error)
                 self.video_worker.status_changed.connect(self.on_video_status_changed)
-                
-                # 开始处理
+
+                print("Starting video worker...")  # 调试输出
                 self.video_worker.start_processing()
-                
+
                 self.video_loaded = True
                 self.statusBar().showMessage(f"Video files loaded: {len(file_paths)} files")
-                logger.info(f"Video files loaded: {file_paths}")
-                
-                # 更新界面状态
-                self.start_processing_action.setEnabled(True)
-                
+
             elif len(file_paths) == 1:
-                DialogUtils.show_warning(self, "Warning", 
-                                       "Please select two video files for stereo analysis")
-            
+                DialogUtils.show_warning(self, "Warning",
+                                         "Please select two video files for stereo analysis")
+
         except Exception as e:
-            logger.error(f"Failed to open video files: {e}")
+            print(f"Error in open_video_files: {e}")
             DialogUtils.show_error(self, "Error", f"Failed to open video files: {e}")
-    
+
     def open_calibration_window(self):
         """打开标定窗口"""
         try:
@@ -635,11 +643,12 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             logger.error(f"Failed to reset trajectory: {e}")
-    
+
     def on_frames_ready(self, frame1, frame2, timestamp):
         """双路帧就绪"""
-        self.video_widget.update_frames(frame1, frame2)
-    
+        if hasattr(self, 'video_widget'):
+            self.video_widget.update_frames(frame1, frame2)
+
     def on_single_frame_ready(self, camera_id, frame, timestamp):
         """单路帧就绪"""
         # 发送给检测线程

@@ -6,8 +6,8 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QTimer
 from collections import deque
-from .detector_core import ShuttlecockDetector, StereoProcessor
-from .config import config
+from detector_core import ShuttlecockDetector, StereoProcessor
+from config import config
 
 
 class DetectionWorker(QThread):

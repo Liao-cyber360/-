@@ -5,6 +5,7 @@
 import cv2
 import time
 import numpy as np
+import os
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 from collections import deque
@@ -86,62 +87,56 @@ class VideoWorker(QThread):
         self.seek_frame = frame_number
         self.condition.wakeAll()
         self.mutex.unlock()
-    
+
     def initialize_capture(self):
-        """初始化视频捕获"""
+        """初始化视频捕获 - 添加调试信息"""
         try:
+            print(f"Initializing capture for camera {self.camera_id}, source: {self.video_source}")
+
             if self.cap is not None:
                 self.cap.release()
-            
-            # 判断是文件、相机还是网络摄像头
+
+            # 判断视频源类型
             if isinstance(self.video_source, str):
-                if self.video_source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
-                    # 网络摄像头
-                    self.is_network_camera = True
-                    self.network_session = requests.Session()
-                    self.cap = cv2.VideoCapture(self.video_source)
-                    
-                    if not self.cap.isOpened():
-                        raise ValueError(f"Cannot open network camera: {self.video_source}")
-                    
-                    self.total_frames = 0
-                    self.fps = 30.0
-                    
-                else:
-                    # 视频文件
-                    self.is_network_camera = False
-                    self.cap = cv2.VideoCapture(self.video_source)
-                    if not self.cap.isOpened():
-                        raise ValueError(f"Cannot open video file: {self.video_source}")
-                    
-                    self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-                
+                print(f"Opening video file: {self.video_source}")
+
+                # 检查文件是否存在
+                if not os.path.exists(self.video_source):
+                    raise FileNotFoundError(f"Video file not found: {self.video_source}")
+
+                self.cap = cv2.VideoCapture(self.video_source)
+                if not self.cap.isOpened():
+                    raise ValueError(f"Cannot open video file: {self.video_source}")
+
+                # 获取视频信息
+                self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+                print(f"Video info - Total frames: {self.total_frames}, FPS: {self.fps}")
+
             elif isinstance(self.video_source, int):
-                # 摄像头
-                self.is_network_camera = False
+                print(f"Opening camera: {self.video_source}")
                 self.cap = cv2.VideoCapture(self.video_source)
                 if not self.cap.isOpened():
                     raise ValueError(f"Cannot open camera {self.video_source}")
-                
+
                 # 设置摄像头参数
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
-                
+
                 self.total_frames = 0
                 self.fps = 30.0
-            
-            else:
-                raise ValueError("Invalid video source")
-            
+
             # 发送视频信息
             self.video_info.emit(self.camera_id, self.total_frames, self.fps)
             self.status_changed.emit(self.camera_id, "Connected")
-            
+
+            print(f"Camera {self.camera_id} initialized successfully")
             return True
-            
+
         except Exception as e:
+            print(f"Camera {self.camera_id} initialization error: {str(e)}")
             self.error_occurred.emit(f"Camera {self.camera_id} initialization error: {str(e)}")
             self.status_changed.emit(self.camera_id, "Error")
             return False
@@ -262,13 +257,14 @@ class VideoWorker(QThread):
 
 class DualVideoWorker(QThread):
     """双路视频处理工作线程 - 简化版本，支持暂停-预测工作流"""
-    
-    # 信号定义
+
+    # 信号定义 - 统一名称
+    frames_ready = pyqtSignal(np.ndarray, np.ndarray, float)  # (frame1, frame2, timestamp)
     frame_ready = pyqtSignal(int, np.ndarray, float)  # (camera_id, frame, timestamp)
     error_occurred = pyqtSignal(str)
     status_changed = pyqtSignal(str)
     buffered_frames_ready = pyqtSignal(list, list, list, list)  # (frames1, timestamps1, frames2, timestamps2)
-    
+
     def __init__(self, video_source1=None, video_source2=None):
         super().__init__()
         

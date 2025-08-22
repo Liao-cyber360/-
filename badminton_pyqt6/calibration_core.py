@@ -8,7 +8,7 @@ import os
 import time
 from ultralytics import YOLO
 try:
-    from .config import config
+    from config import config
 except ImportError:
     from config import config
 

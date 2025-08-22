@@ -8,7 +8,7 @@ from ultralytics import YOLO
 from collections import deque
 import time
 try:
-    from .config import config
+    from config import config
 except ImportError:
     from config import config
 
