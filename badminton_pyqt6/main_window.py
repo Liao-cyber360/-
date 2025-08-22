@@ -7,7 +7,9 @@ import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QMenuBar, QMenu, QStatusBar, QSplitter, QLabel,
                             QFileDialog, QMessageBox, QApplication, QToolBar,
-                            QProgressBar, QFrame, QDockWidget, QPushButton)
+                            QProgressBar, QFrame, QDockWidget, QPushButton,
+                            QGroupBox, QFormLayout, QDoubleSpinBox, QSlider,
+                            QLineEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QSettings
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 import time
@@ -103,65 +105,314 @@ class MainWindow(QMainWindow):
         self.setup_dock_widgets()
     
     def setup_main_tab(self):
-        """设置主监控标签页"""
+        """设置主监控标签页 - 优化布局：大视频区域，参数在底部"""
         main_tab = QWidget()
-        layout = QHBoxLayout(main_tab)
+        layout = QVBoxLayout(main_tab)  # 改为垂直布局
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(10)
         
-        # 创建分割器 - 调整比例为4:3视频
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # 主要区域：视频显示 (占绝大部分空间)
+        self.setup_video_area_large(layout)
         
-        # 左侧：视频显示区域 (4:3比例)
-        self.setup_video_area(main_splitter)
-        
-        # 右侧：3D可视化区域 (更大空间)
-        self.setup_visualization_area(main_splitter)
-        
-        # 设置分割器比例 - 给3D可视化更多空间
-        main_splitter.setSizes([800, 700])
-        layout.addWidget(main_splitter)
+        # 底部区域：控制参数 (紧凑布局)
+        self.setup_control_parameters_bottom(layout)
         
         self.tab_widget.addTab(main_tab, "主监控")
     
     def setup_calibration_tab(self):
-        """设置标定标签页"""
+        """设置标定标签页 - 完整的标定功能界面"""
         calibration_tab = QWidget()
         layout = QVBoxLayout(calibration_tab)
         
-        # 标定控制面板
+        # 标定控制面板标题
         calibration_label = QLabel("相机标定与配置")
         calibration_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
         layout.addWidget(calibration_label)
         
-        # 这里可以添加标定相关的控件
-        placeholder = QLabel("标定功能将在这里实现\n支持本地视频和摄像头的多帧YOLO角点检测")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet("background-color: #f0f0f0; padding: 20px; border-radius: 5px;")
-        layout.addWidget(placeholder)
+        # 创建水平分割器：左侧标定区域，右侧控制面板
+        calibration_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧：标定操作区域
+        self.setup_calibration_work_area(calibration_splitter)
+        
+        # 右侧：标定控制面板
+        self.setup_calibration_control_panel(calibration_splitter)
+        
+        # 设置分割器比例
+        calibration_splitter.setSizes([800, 400])
+        layout.addWidget(calibration_splitter)
         
         self.tab_widget.addTab(calibration_tab, "相机标定")
+
+    def setup_calibration_work_area(self, parent):
+        """设置标定工作区域"""
+        work_frame = QFrame()
+        work_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        work_layout = QVBoxLayout(work_frame)
+        work_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 说明文字
+        info_label = QLabel("标定说明：只能从缓冲视频帧中选择图片进行标定，确保视频帧为原画质量。")
+        info_label.setStyleSheet("color: #666; font-style: italic; padding: 10px; background-color: #f8f8f8; border-radius: 5px;")
+        work_layout.addWidget(info_label)
+        
+        # 帧选择区域
+        frame_selection_group = QGroupBox("视频帧选择")
+        frame_selection_layout = QVBoxLayout(frame_selection_group)
+        
+        # 帧缓冲显示
+        self.frame_buffer_label = QLabel("当前缓冲帧数: 0")
+        frame_selection_layout.addWidget(self.frame_buffer_label)
+        
+        # 帧选择控件
+        frame_control_layout = QHBoxLayout()
+        
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(0)
+        self.frame_slider.setValue(0)
+        frame_control_layout.addWidget(self.frame_slider)
+        
+        self.frame_number_label = QLabel("0 / 0")
+        frame_control_layout.addWidget(self.frame_number_label)
+        
+        frame_selection_layout.addLayout(frame_control_layout)
+        
+        # 选择帧按钮
+        select_frame_layout = QHBoxLayout()
+        
+        self.select_frame1_btn = QPushButton("选择作为Camera1标定帧")
+        self.select_frame1_btn.setEnabled(False)
+        select_frame_layout.addWidget(self.select_frame1_btn)
+        
+        self.select_frame2_btn = QPushButton("选择作为Camera2标定帧")
+        self.select_frame2_btn.setEnabled(False)
+        select_frame_layout.addWidget(self.select_frame2_btn)
+        
+        frame_selection_layout.addLayout(select_frame_layout)
+        
+        work_layout.addWidget(frame_selection_group)
+        
+        # 当前标定帧显示
+        current_frame_group = QGroupBox("当前标定帧")
+        current_frame_layout = QHBoxLayout(current_frame_group)
+        
+        # Camera 1标定帧
+        cam1_frame = QFrame()
+        cam1_layout = QVBoxLayout(cam1_frame)
+        cam1_layout.addWidget(QLabel("Camera 1"))
+        self.calib_frame1_label = QLabel("未选择")
+        self.calib_frame1_label.setMinimumSize(300, 200)
+        self.calib_frame1_label.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0;")
+        self.calib_frame1_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cam1_layout.addWidget(self.calib_frame1_label)
+        current_frame_layout.addWidget(cam1_frame)
+        
+        # Camera 2标定帧
+        cam2_frame = QFrame()
+        cam2_layout = QVBoxLayout(cam2_frame)
+        cam2_layout.addWidget(QLabel("Camera 2"))
+        self.calib_frame2_label = QLabel("未选择")
+        self.calib_frame2_label.setMinimumSize(300, 200)
+        self.calib_frame2_label.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0;")
+        self.calib_frame2_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cam2_layout.addWidget(self.calib_frame2_label)
+        current_frame_layout.addWidget(cam2_frame)
+        
+        work_layout.addWidget(current_frame_group)
+        
+        parent.addWidget(work_frame)
+
+    def setup_calibration_control_panel(self, parent):
+        """设置标定控制面板"""
+        control_frame = QFrame()
+        control_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        control_layout = QVBoxLayout(control_frame)
+        control_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 标定参数设置
+        params_group = QGroupBox("标定参数")
+        params_layout = QFormLayout(params_group)
+        
+        # 相机参数文件路径
+        self.camera_params_path_edit = QLineEdit()
+        self.camera_params_path_edit.setPlaceholderText("选择相机参数文件...")
+        params_layout.addRow("相机参数:", self.camera_params_path_edit)
+        
+        browse_params_btn = QPushButton("浏览...")
+        browse_params_btn.clicked.connect(self.browse_camera_params_file)
+        params_layout.addRow("", browse_params_btn)
+        
+        # YOLO模型文件路径
+        self.yolo_model_path_edit = QLineEdit()
+        self.yolo_model_path_edit.setPlaceholderText("选择YOLO模型文件...")
+        params_layout.addRow("YOLO模型:", self.yolo_model_path_edit)
+        
+        browse_yolo_btn = QPushButton("浏览...")
+        browse_yolo_btn.clicked.connect(self.browse_yolo_model_file)
+        params_layout.addRow("", browse_yolo_btn)
+        
+        control_layout.addWidget(params_group)
+        
+        # 标定操作
+        action_group = QGroupBox("标定操作")
+        action_layout = QVBoxLayout(action_group)
+        
+        # 自动检测角点
+        self.auto_detect_btn = QPushButton("自动检测角点")
+        self.auto_detect_btn.setEnabled(False)
+        action_layout.addWidget(self.auto_detect_btn)
+        
+        # 手动标定
+        self.manual_calib_btn = QPushButton("手动标定")
+        self.manual_calib_btn.setEnabled(False)
+        action_layout.addWidget(self.manual_calib_btn)
+        
+        # 开始标定
+        self.start_calibration_btn = QPushButton("开始标定")
+        self.start_calibration_btn.setEnabled(False)
+        self.start_calibration_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        action_layout.addWidget(self.start_calibration_btn)
+        
+        # 重置标定
+        self.reset_calibration_btn = QPushButton("重置标定")
+        action_layout.addWidget(self.reset_calibration_btn)
+        
+        control_layout.addWidget(action_group)
+        
+        # 标定状态
+        status_group = QGroupBox("标定状态")
+        status_layout = QVBoxLayout(status_group)
+        
+        self.calibration_status_label = QLabel("未开始")
+        self.calibration_status_label.setStyleSheet("color: #666;")
+        status_layout.addWidget(self.calibration_status_label)
+        
+        self.calibration_progress = QProgressBar()
+        self.calibration_progress.setVisible(False)
+        status_layout.addWidget(self.calibration_progress)
+        
+        control_layout.addWidget(status_group)
+        
+        control_layout.addStretch()
+        
+        parent.addWidget(control_frame)
     
     def setup_analysis_tab(self):
-        """设置分析标签页"""
+        """设置分析标签页 - 包含3D可视化和轨迹分析"""
         analysis_tab = QWidget()
         layout = QVBoxLayout(analysis_tab)
         
-        # 分析控制面板
-        analysis_label = QLabel("轨迹分析与速度检测")
+        # 分析控制面板标题
+        analysis_label = QLabel("三维轨迹可视化与分析")
         analysis_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
         layout.addWidget(analysis_label)
         
-        # 这里可以添加分析相关的控件
-        placeholder = QLabel("分析功能将在这里实现\n包括最大速度检测和轨迹预测分析")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet("background-color: #f0f0f0; padding: 20px; border-radius: 5px;")
-        layout.addWidget(placeholder)
+        # 创建水平分割器：左侧3D可视化，右侧控制面板
+        analysis_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧：3D可视化区域 (主要空间)
+        self.setup_3d_visualization_area(analysis_splitter)
+        
+        # 右侧：分析控制面板
+        self.setup_analysis_control_panel(analysis_splitter)
+        
+        # 设置分割器比例
+        analysis_splitter.setSizes([1000, 300])
+        layout.addWidget(analysis_splitter)
         
         self.tab_widget.addTab(analysis_tab, "轨迹分析")
+
+    def setup_3d_visualization_area(self, parent):
+        """设置3D可视化区域"""
+        viz_frame = QFrame()
+        viz_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        viz_layout = QVBoxLayout(viz_frame)
+        viz_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 3D可视化标题
+        viz_title = QLabel("3D轨迹可视化")
+        viz_title.setStyleSheet("font-weight: bold; padding: 5px; font-size: 14px;")
+        viz_layout.addWidget(viz_title)
+        
+        # 3D可视化组件 - 占用大部分空间
+        self.viz_3d_widget = Visualization3DWidget()
+        viz_layout.addWidget(self.viz_3d_widget)
+        
+        parent.addWidget(viz_frame)
+
+    def setup_analysis_control_panel(self, parent):
+        """设置分析控制面板"""
+        control_frame = QFrame()
+        control_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        control_layout = QVBoxLayout(control_frame)
+        control_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 3D可视化控制
+        viz_control_group = QGroupBox("可视化控制")
+        viz_control_layout = QVBoxLayout(viz_control_group)
+        
+        # 显示设置
+        self.show_trajectory_btn = QPushButton("显示轨迹")
+        self.show_trajectory_btn.setCheckable(True)
+        self.show_trajectory_btn.setChecked(True)
+        viz_control_layout.addWidget(self.show_trajectory_btn)
+        
+        self.show_prediction_btn = QPushButton("显示预测")
+        self.show_prediction_btn.setCheckable(True)
+        viz_control_layout.addWidget(self.show_prediction_btn)
+        
+        self.show_court_btn = QPushButton("显示场地")
+        self.show_court_btn.setCheckable(True)
+        self.show_court_btn.setChecked(True)
+        viz_control_layout.addWidget(self.show_court_btn)
+        
+        # 重置视图
+        self.reset_view_btn = QPushButton("重置视图")
+        viz_control_layout.addWidget(self.reset_view_btn)
+        
+        control_layout.addWidget(viz_control_group)
+        
+        # 轨迹分析
+        analysis_group = QGroupBox("轨迹分析")
+        analysis_layout = QVBoxLayout(analysis_group)
+        
+        self.max_speed_label = QLabel("最大速度: -- km/h")
+        analysis_layout.addWidget(self.max_speed_label)
+        
+        self.flight_time_label = QLabel("飞行时间: -- s")
+        analysis_layout.addWidget(self.flight_time_label)
+        
+        self.trajectory_points_label = QLabel("轨迹点数: 0")
+        analysis_layout.addWidget(self.trajectory_points_label)
+        
+        # 清除轨迹按钮
+        self.clear_trajectory_btn = QPushButton("清除轨迹")
+        analysis_layout.addWidget(self.clear_trajectory_btn)
+        
+        control_layout.addWidget(analysis_group)
+        
+        control_layout.addStretch()
+        
+        parent.addWidget(control_frame)
     
-    def setup_video_area(self, parent):
-        """设置视频显示区域 - 4:3比例优化"""
+    def setup_video_area_large(self, parent_layout):
+        """设置大视频显示区域 - 占据主要空间"""
         # 视频区域容器
         video_frame = QFrame()
         video_frame.setFrameStyle(QFrame.Shape.StyledPanel)
@@ -169,60 +420,92 @@ class MainWindow(QMainWindow):
         video_layout.setContentsMargins(5, 5, 5, 5)
         
         # 视频标题
-        video_title = QLabel("双路视频监控 (4:3)")
-        video_title.setStyleSheet("font-weight: bold; padding: 5px;")
+        video_title = QLabel("双路视频监控")
+        video_title.setStyleSheet("font-weight: bold; padding: 5px; font-size: 14px;")
         video_layout.addWidget(video_title)
         
-        # 视频显示组件 - 设置为4:3比例
+        # 视频显示组件 - 设置为更大尺寸
         self.video_widget = DualVideoWidget()
-        # 设置固定的4:3比例 (640x480 * 2 + 间距)
-        self.video_widget.setMinimumSize(1300, 500)
+        # 设置更大的尺寸让视频占据更多空间
+        self.video_widget.setMinimumSize(1600, 600)  # 增大视频显示区域
         video_layout.addWidget(self.video_widget)
         
-        # 控制按钮区域
+        parent_layout.addWidget(video_frame, 4)  # 给视频区域分配更多比重 (4/5)
+
+    def setup_control_parameters_bottom(self, parent_layout):
+        """设置底部控制参数区域 - 紧凑布局"""
+        # 控制参数容器
         control_frame = QFrame()
+        control_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        control_frame.setMaximumHeight(150)  # 限制高度，保持紧凑
         control_layout = QHBoxLayout(control_frame)
+        control_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 暂停按钮
+        # 视频控制区域
+        video_control_group = QGroupBox("视频控制")
+        video_control_layout = QHBoxLayout(video_control_group)
+        
+        # 播放控制按钮
         self.pause_btn = QPushButton("暂停")
         self.pause_btn.clicked.connect(self.on_pause_clicked)
-        control_layout.addWidget(self.pause_btn)
+        self.pause_btn.setFixedSize(80, 30)
+        video_control_layout.addWidget(self.pause_btn)
         
-        # 预测按钮 - 仅在暂停后可用
         self.predict_btn = QPushButton("开始预测")
         self.predict_btn.setEnabled(False)
         self.predict_btn.clicked.connect(self.on_predict_clicked)
-        control_layout.addWidget(self.predict_btn)
+        self.predict_btn.setFixedSize(80, 30)
+        video_control_layout.addWidget(self.predict_btn)
         
-        # 速度检测按钮
         self.speed_detect_btn = QPushButton("速度检测")
         self.speed_detect_btn.setEnabled(False)
         self.speed_detect_btn.clicked.connect(self.on_speed_detect_clicked)
-        control_layout.addWidget(self.speed_detect_btn)
+        self.speed_detect_btn.setFixedSize(80, 30)
+        video_control_layout.addWidget(self.speed_detect_btn)
         
-        control_layout.addStretch()
-        video_layout.addWidget(control_frame)
+        control_layout.addWidget(video_control_group)
         
-        parent.addWidget(video_frame)
-    
-    def setup_visualization_area(self, parent):
-        """设置可视化区域 - 仅3D可视化，更大空间"""
-        # 可视化区域容器
-        viz_frame = QFrame()
-        viz_frame.setFrameStyle(QFrame.Shape.StyledPanel)
-        viz_layout = QVBoxLayout(viz_frame)
-        viz_layout.setContentsMargins(5, 5, 5, 5)
+        # 检测参数区域
+        detection_group = QGroupBox("检测参数")
+        detection_layout = QFormLayout(detection_group)
+        detection_layout.setVerticalSpacing(2)  # 紧凑间距
         
-        # 可视化标题
-        viz_title = QLabel("3D轨迹可视化")
-        viz_title.setStyleSheet("font-weight: bold; padding: 5px;")
-        viz_layout.addWidget(viz_title)
+        # 置信度设置
+        self.confidence_spinbox = QDoubleSpinBox()
+        self.confidence_spinbox.setRange(0.1, 1.0)
+        self.confidence_spinbox.setSingleStep(0.1)
+        self.confidence_spinbox.setValue(0.5)
+        self.confidence_spinbox.setFixedWidth(80)
+        detection_layout.addRow("置信度:", self.confidence_spinbox)
         
-        # 3D可视化 - 占用全部空间
-        self.viz_3d_widget = Visualization3DWidget()
-        viz_layout.addWidget(self.viz_3d_widget)
+        # NMS阈值
+        self.nms_spinbox = QDoubleSpinBox()
+        self.nms_spinbox.setRange(0.1, 1.0)
+        self.nms_spinbox.setSingleStep(0.1)
+        self.nms_spinbox.setValue(0.4)
+        self.nms_spinbox.setFixedWidth(80)
+        detection_layout.addRow("NMS:", self.nms_spinbox)
         
-        parent.addWidget(viz_frame)
+        control_layout.addWidget(detection_group)
+        
+        # 状态显示区域
+        status_group = QGroupBox("系统状态")
+        status_layout = QFormLayout(status_group)
+        status_layout.setVerticalSpacing(2)
+        
+        self.fps_status_label = QLabel("FPS: --")
+        self.fps_status_label.setStyleSheet("color: #666;")
+        status_layout.addRow("处理速度:", self.fps_status_label)
+        
+        self.detection_status_label = QLabel("未检测")
+        self.detection_status_label.setStyleSheet("color: red;")
+        status_layout.addRow("球检测:", self.detection_status_label)
+        
+        control_layout.addWidget(status_group)
+        
+        control_layout.addStretch()  # 添加弹性空间
+        
+        parent_layout.addWidget(control_frame, 1)  # 给控制区域分配较小比重 (1/5)
     
     def setup_dock_widgets(self):
         """设置停靠窗口"""
@@ -243,6 +526,13 @@ class MainWindow(QMainWindow):
         open_video_action.setStatusTip("Open dual video files for analysis")
         open_video_action.triggered.connect(self.open_video_files)
         file_menu.addAction(open_video_action)
+        
+        # 网络摄像头连接
+        open_camera_action = QAction("Connect Network Cameras...", self)
+        open_camera_action.setShortcut("Ctrl+Shift+O")
+        open_camera_action.setStatusTip("Connect to network cameras via IP (mutually exclusive with video files)")
+        open_camera_action.triggered.connect(self.open_network_cameras)
+        file_menu.addAction(open_camera_action)
         
         # 加载配置
         load_config_action = QAction("Load Configuration...", self)
@@ -477,6 +767,9 @@ class MainWindow(QMainWindow):
 
                 print("Starting video worker...")  # 调试输出
                 self.video_worker.start_processing()
+                
+                # 自动开始播放视频
+                self.video_worker.play()
 
                 self.video_loaded = True
                 self.statusBar().showMessage(f"Video files loaded: {len(file_paths)} files")
@@ -488,6 +781,83 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error in open_video_files: {e}")
             DialogUtils.show_error(self, "Error", f"Failed to open video files: {e}")
+
+    def open_network_cameras(self):
+        """连接网络摄像头 - 与本地视频互斥"""
+        try:
+            # 创建IP输入对话框
+            from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QLabel, QVBoxLayout
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Connect Network Cameras")
+            dialog.setModal(True)
+            dialog.setMinimumWidth(400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # 说明文字
+            info_label = QLabel("注意：网络摄像头和本地视频是互相替代关系，只能选择其中一种。")
+            info_label.setStyleSheet("color: #666; font-style: italic; margin-bottom: 10px;")
+            layout.addWidget(info_label)
+            
+            form_layout = QFormLayout()
+            
+            # 摄像头1 IP输入
+            camera1_ip = QLineEdit()
+            camera1_ip.setPlaceholderText("例如: rtsp://192.168.1.100:554/stream1")
+            camera1_ip.setText("rtsp://192.168.1.100:554/stream1")  # 默认值
+            form_layout.addRow("Camera 1 IP/URL:", camera1_ip)
+            
+            # 摄像头2 IP输入  
+            camera2_ip = QLineEdit()
+            camera2_ip.setPlaceholderText("例如: rtsp://192.168.1.101:554/stream1")
+            camera2_ip.setText("rtsp://192.168.1.101:554/stream1")  # 默认值
+            form_layout.addRow("Camera 2 IP/URL:", camera2_ip)
+            
+            layout.addLayout(form_layout)
+            
+            # 按钮
+            button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addWidget(button_box)
+            
+            # 显示对话框
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                ip1 = camera1_ip.text().strip()
+                ip2 = camera2_ip.text().strip()
+                
+                if not ip1 or not ip2:
+                    DialogUtils.show_warning(self, "Warning", "Please enter both camera IP addresses/URLs")
+                    return
+                
+                # 停止现有的视频处理
+                if self.video_worker:
+                    self.video_worker.stop()
+                    self.video_worker = None
+                
+                # 创建网络摄像头工作线程
+                from video_worker import DualVideoWorker
+                self.video_worker = DualVideoWorker(ip1, ip2)
+                
+                # 连接信号
+                self.video_worker.frames_ready.connect(self.on_frames_ready)
+                self.video_worker.frame_ready.connect(self.on_single_frame_ready)
+                self.video_worker.error_occurred.connect(self.on_worker_error)
+                self.video_worker.status_changed.connect(self.on_video_status_changed)
+                
+                print(f"Starting network cameras: {ip1}, {ip2}")
+                self.video_worker.start_processing()
+                
+                # 自动开始播放视频
+                self.video_worker.play()
+                
+                self.video_loaded = True
+                self.statusBar().showMessage(f"Network cameras connected: {ip1}, {ip2}")
+                
+        except Exception as e:
+            print(f"Error in open_network_cameras: {e}")
+            DialogUtils.show_error(self, "Error", f"Failed to connect network cameras: {e}")
 
     def open_calibration_window(self):
         """打开标定窗口"""
@@ -1118,3 +1488,22 @@ Developed with PyQt6, OpenCV, YOLO, and Open3D.
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
             event.accept()  # 强制关闭
+
+    # 标定相关方法
+    def browse_camera_params_file(self):
+        """浏览相机参数文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Camera Parameters File", "", 
+            "YAML Files (*.yaml *.yml)"
+        )
+        if file_path:
+            self.camera_params_path_edit.setText(file_path)
+
+    def browse_yolo_model_file(self):
+        """浏览YOLO模型文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select YOLO Model File", "", 
+            "PyTorch Files (*.pt)"
+        )
+        if file_path:
+            self.yolo_model_path_edit.setText(file_path)

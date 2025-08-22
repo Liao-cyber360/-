@@ -323,8 +323,8 @@ class CalibrationWindow(QDialog):
         # 图像控制按钮
         image_control_layout = QHBoxLayout()
         
-        self.load_image_btn = QPushButton("Load Image")
-        self.load_image_btn.setStyleSheet("""
+        self.frame_select_btn = QPushButton("从视频帧选择")
+        self.frame_select_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
                 color: white;
@@ -337,7 +337,7 @@ class CalibrationWindow(QDialog):
                 background-color: #45a049;
             }
         """)
-        image_control_layout.addWidget(self.load_image_btn)
+        image_control_layout.addWidget(self.frame_select_btn)
         
         self.fit_view_btn = QPushButton("Fit to View")
         self.fit_view_btn.setStyleSheet("""
@@ -549,7 +549,7 @@ class CalibrationWindow(QDialog):
         self.image_view.point_clicked.connect(self.on_point_clicked)
         
         # 按钮
-        self.load_image_btn.clicked.connect(self.load_image)
+        self.frame_select_btn.clicked.connect(self.select_from_video_frame)
         self.fit_view_btn.clicked.connect(self.image_view.fit_to_view)
         self.clear_points_btn.clicked.connect(self.clear_all_points)
         self.start_calibration_btn.clicked.connect(self.start_calibration)
@@ -577,25 +577,42 @@ class CalibrationWindow(QDialog):
             self.yolo_model_path.setStyleSheet("color: #333;")
             self.check_ready_state()
     
-    def load_image(self):
-        """加载图像"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Calibration Image", "", 
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff)"
-        )
-        
-        if file_path:
-            try:
-                image = cv2.imread(file_path)
-                if image is not None:
-                    self.current_image = image
-                    self.image_view.set_image(image)
-                    self.status_label.setText(f"Image loaded: {file_path}")
-                    self.check_ready_state()
-                else:
-                    QMessageBox.warning(self, "Error", "Failed to load image")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
+    def select_from_video_frame(self):
+        """从视频帧选择标定图像 - 替代文件加载"""
+        try:
+            # 这里需要从主窗口获取当前视频帧
+            # 注意：确保视频帧是原画质量
+            from PyQt6.QtWidgets import QInputDialog
+            
+            # 简单的帧选择对话框（实际实现中应该连接到视频缓冲区）
+            items = ["Camera 1 - 当前帧", "Camera 2 - 当前帧", "从缓冲区选择..."]
+            item, ok = QInputDialog.getItem(
+                self, "选择视频帧", "选择要用于标定的视频帧:", items, 0, False
+            )
+            
+            if ok and item:
+                # 这里应该实现从视频工作线程获取原画帧的逻辑
+                # 暂时显示提示信息
+                self.status_label.setText(f"从视频帧选择: {item} (需要连接视频缓冲区)")
+                
+                # 模拟加载一个帧的逻辑
+                # 在实际实现中，这里应该：
+                # 1. 从video_worker获取当前帧或缓冲帧
+                # 2. 确保帧是原画质量（未压缩）
+                # 3. 设置到image_view中
+                
+                # 临时提示
+                QMessageBox.information(
+                    self, "提示", 
+                    "视频帧选择功能已启用。\n"
+                    "请确保：\n"
+                    "1. 视频正在播放或已暂停\n"
+                    "2. 选择的帧质量为原画\n"
+                    "3. 帧中包含清晰的球场边界"
+                )
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to select video frame: {str(e)}")
     
     def on_point_clicked(self, x, y):
         """处理点击事件"""
