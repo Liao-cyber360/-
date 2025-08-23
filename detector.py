@@ -397,6 +397,168 @@ class BufferedImageProcessor:
             print("Image buffer cleared")
 
 
+class MultiBallTracker:
+    """多球追踪器 - 处理场地上同时存在的多个羽毛球"""
+    
+    def __init__(self, max_balls=2, tracking_distance_threshold=100):
+        """
+        初始化多球追踪器
+        
+        Args:
+            max_balls: 最大追踪球数量
+            tracking_distance_threshold: 球之间的最小距离阈值(cm)
+        """
+        self.max_balls = max_balls
+        self.tracking_distance_threshold = tracking_distance_threshold
+        
+        # 球的轨迹
+        self.ball_trajectories = {}  # ball_id -> {'points': [], 'timestamps': [], 'last_update': time}
+        self.next_ball_id = 0
+        self.trajectory_timeout = 2.0  # 2秒未更新则移除轨迹
+        
+        # 球的状态
+        self.active_balls = {}  # ball_id -> {'last_point': (x,y,z), 'confidence': float, 'age': int}
+        
+        print(f"MultiBallTracker initialized: max_balls={max_balls}, distance_threshold={tracking_distance_threshold}cm")
+    
+    def update_detections(self, points_3d, timestamps):
+        """
+        更新检测到的3D点，分配给不同的球
+        
+        Args:
+            points_3d: 新检测到的3D点列表
+            timestamps: 对应的时间戳列表
+            
+        Returns:
+            dict: {ball_id: {'points': [...], 'timestamps': [...]}}
+        """
+        current_time = timestamps[-1] if timestamps else time.time()
+        
+        # 清理过期的轨迹
+        self._cleanup_old_trajectories(current_time)
+        
+        # 对每个新检测点进行分配
+        assigned_points = {}  # ball_id -> [(point, timestamp), ...]
+        unassigned_points = list(zip(points_3d, timestamps))
+        
+        # 尝试将点分配给现有轨迹
+        for ball_id in list(self.active_balls.keys()):
+            best_match = None
+            best_distance = float('inf')
+            
+            for i, (point, timestamp) in enumerate(unassigned_points):
+                distance = np.linalg.norm(np.array(point) - np.array(self.active_balls[ball_id]['last_point']))
+                
+                if distance < self.tracking_distance_threshold and distance < best_distance:
+                    best_match = i
+                    best_distance = distance
+            
+            if best_match is not None:
+                point, timestamp = unassigned_points.pop(best_match)
+                
+                if ball_id not in assigned_points:
+                    assigned_points[ball_id] = []
+                assigned_points[ball_id].append((point, timestamp))
+                
+                # 更新球的状态
+                self.active_balls[ball_id]['last_point'] = point
+                self.active_balls[ball_id]['age'] += 1
+        
+        # 为未分配的点创建新轨迹
+        for point, timestamp in unassigned_points:
+            if len(self.active_balls) < self.max_balls:
+                ball_id = self.next_ball_id
+                self.next_ball_id += 1
+                
+                self.active_balls[ball_id] = {
+                    'last_point': point,
+                    'confidence': 1.0,
+                    'age': 1
+                }
+                
+                if ball_id not in assigned_points:
+                    assigned_points[ball_id] = []
+                assigned_points[ball_id].append((point, timestamp))
+                
+                print(f"Created new ball trajectory: ball_id={ball_id}")
+        
+        # 更新轨迹数据
+        for ball_id, point_timestamp_list in assigned_points.items():
+            if ball_id not in self.ball_trajectories:
+                self.ball_trajectories[ball_id] = {
+                    'points': [],
+                    'timestamps': [],
+                    'last_update': current_time
+                }
+            
+            for point, timestamp in point_timestamp_list:
+                self.ball_trajectories[ball_id]['points'].append(point)
+                self.ball_trajectories[ball_id]['timestamps'].append(timestamp)
+                self.ball_trajectories[ball_id]['last_update'] = current_time
+        
+        return self.ball_trajectories
+    
+    def _cleanup_old_trajectories(self, current_time):
+        """清理过期的轨迹"""
+        expired_balls = []
+        
+        for ball_id, trajectory in self.ball_trajectories.items():
+            if current_time - trajectory['last_update'] > self.trajectory_timeout:
+                expired_balls.append(ball_id)
+        
+        for ball_id in expired_balls:
+            del self.ball_trajectories[ball_id]
+            if ball_id in self.active_balls:
+                del self.active_balls[ball_id]
+            print(f"Removed expired ball trajectory: ball_id={ball_id}")
+    
+    def get_active_trajectories(self):
+        """获取当前活跃的轨迹"""
+        return dict(self.ball_trajectories)
+    
+    def get_trajectory_for_prediction(self, ball_id=None):
+        """
+        获取用于预测的轨迹
+        
+        Args:
+            ball_id: 指定球的ID，如果为None则返回最活跃的轨迹
+            
+        Returns:
+            tuple: (points, timestamps, ball_id) 或 None
+        """
+        if not self.ball_trajectories:
+            return None
+        
+        if ball_id is not None and ball_id in self.ball_trajectories:
+            trajectory = self.ball_trajectories[ball_id]
+            return trajectory['points'], trajectory['timestamps'], ball_id
+        
+        # 返回点数最多的轨迹（最活跃）
+        best_ball_id = max(self.ball_trajectories.keys(), 
+                          key=lambda bid: len(self.ball_trajectories[bid]['points']))
+        
+        trajectory = self.ball_trajectories[best_ball_id]
+        return trajectory['points'], trajectory['timestamps'], best_ball_id
+    
+    def get_balls_summary(self):
+        """获取球的状态摘要"""
+        summary = {
+            'total_balls': len(self.active_balls),
+            'balls_info': {}
+        }
+        
+        for ball_id, ball_info in self.active_balls.items():
+            trajectory = self.ball_trajectories.get(ball_id, {'points': [], 'timestamps': []})
+            summary['balls_info'][ball_id] = {
+                'last_position': ball_info['last_point'],
+                'trajectory_length': len(trajectory['points']),
+                'age': ball_info['age'],
+                'confidence': ball_info['confidence']
+            }
+        
+        return summary
+
+
 class StereoProcessor:
     """增强的双目视觉处理器 - 添加调试数据追踪"""
 
@@ -407,6 +569,9 @@ class StereoProcessor:
 
         # 轨迹管理
         self.trajectory_manager = TrajectorySegmentManager()
+        
+        # 多球追踪器
+        self.multi_ball_tracker = MultiBallTracker(max_balls=2, tracking_distance_threshold=100)
 
         # 场地过滤参数 (cm) - 扩大范围支持场地外预测
         self.court_bounds = {
@@ -427,7 +592,7 @@ class StereoProcessor:
         self.low_quality_points = []  # 质量评估低的点
         self.triangulation_failed_points = []  # 三角测量失败的点对
 
-        print("StereoProcessor initialized with debug tracking enabled")
+        print("StereoProcessor initialized with debug tracking and multi-ball support enabled")
 
     def load_camera_parameters(self, camera1_file, camera2_file):
         """加载相机参数"""
@@ -546,6 +711,17 @@ class StereoProcessor:
         self.all_3d_points = all_3d_points
         self.all_timestamps = all_timestamps_3d
 
+        # 使用多球追踪器分配点到不同的球
+        if all_3d_points and all_timestamps_3d:
+            ball_trajectories = self.multi_ball_tracker.update_detections(all_3d_points, all_timestamps_3d)
+            
+            # 打印多球追踪状态
+            summary = self.multi_ball_tracker.get_balls_summary()
+            print(f"Multi-ball tracking: {summary['total_balls']} active balls")
+            for ball_id, info in summary['balls_info'].items():
+                print(f"  Ball {ball_id}: {info['trajectory_length']} points, "
+                      f"last pos: ({info['last_position'][0]:.1f}, {info['last_position'][1]:.1f}, {info['last_position'][2]:.1f})")
+
         print(f"Generated {len(all_3d_points)} valid 3D points from batch processing")
         print(f"Rejected {len(self.rejected_points)} out-of-bounds points")
         print(f"Failed triangulation for {len(self.triangulation_failed_points)} point pairs")
@@ -656,7 +832,92 @@ class StereoProcessor:
                 self.court_bounds['y_min'] <= y <= self.court_bounds['y_max'] and
                 self.court_bounds['z_min'] <= z <= self.court_bounds['z_max'])
 
-    def find_best_trajectory_for_prediction(self, current_time):
+    def find_best_trajectory_for_prediction(self, current_time, ball_id=None):
+        """
+        找到最适合预测的轨迹片段 - 支持多球选择
+        
+        Args:
+            current_time: 当前时间
+            ball_id: 指定球的ID，如果为None则自动选择最佳轨迹
+            
+        Returns:
+            tuple: (points, timestamps, confidence, ball_id) 或 (None, None, 0.0, None)
+        """
+        # 首先尝试从多球追踪器获取轨迹
+        if ball_id is not None:
+            trajectory_data = self.multi_ball_tracker.get_trajectory_for_prediction(ball_id)
+            if trajectory_data:
+                points, timestamps, actual_ball_id = trajectory_data
+                if len(points) >= 5:
+                    # 使用现有的轨迹段管理器评估质量
+                    best_points, best_timestamps, confidence = self.trajectory_manager.find_best_trajectory_segment(
+                        points, timestamps, current_time
+                    )
+                    return best_points, best_timestamps, confidence, actual_ball_id
+        
+        # 自动选择最佳轨迹
+        all_trajectories = self.multi_ball_tracker.get_active_trajectories()
+        best_trajectory = None
+        best_confidence = 0.0
+        best_ball_id = None
+        
+        for trajectory_ball_id, trajectory_data in all_trajectories.items():
+            points = trajectory_data['points']
+            timestamps = trajectory_data['timestamps']
+            
+            if len(points) >= 5:
+                traj_points, traj_timestamps, confidence = self.trajectory_manager.find_best_trajectory_segment(
+                    points, timestamps, current_time
+                )
+                
+                if confidence > best_confidence:
+                    best_trajectory = (traj_points, traj_timestamps)
+                    best_confidence = confidence
+                    best_ball_id = trajectory_ball_id
+        
+        if best_trajectory:
+            return best_trajectory[0], best_trajectory[1], best_confidence, best_ball_id
+        
+        # 备用方案：使用原有的单轨迹方法
+        if len(self.all_3d_points) < 5:
+            return None, None, 0.0, None
+
+        # 在寻找最佳轨迹之前，记录所有不符合质量要求的点
+        # 这里可以添加更复杂的质量评估逻辑
+        for i, (point, timestamp) in enumerate(zip(self.all_3d_points, self.all_timestamps)):
+            # 简单的质量检查示例
+            if i > 0:
+                prev_point = self.all_3d_points[i - 1]
+                prev_time = self.all_timestamps[i - 1]
+
+                # 检查距离和时间间隔的合理性
+                distance = np.linalg.norm(point - prev_point)
+                time_diff = timestamp - prev_time
+
+                if time_diff > 0:
+                    velocity = distance / time_diff
+                    # 如果速度异常高，标记为低质量点
+                    if velocity > 2000:  # 20m/s
+                        self.low_quality_points.append({
+                            'point_3d': point,
+                            'timestamp': timestamp,
+                            'reason': 'high_velocity',
+                            'velocity': velocity,
+                            'distance': distance,
+                            'time_diff': time_diff
+                        })
+
+        best_points, best_timestamps, confidence = self.trajectory_manager.find_best_trajectory_segment(
+            self.all_3d_points, self.all_timestamps, current_time
+        )
+
+        return best_points, best_timestamps, confidence, None
+    
+    def get_multi_ball_status(self):
+        """获取多球状态信息"""
+        return self.multi_ball_tracker.get_balls_summary()
+
+    def find_best_trajectory_for_prediction_legacy(self, current_time)::
         """找到最适合预测的轨迹片段 - 记录被排除的低质量点"""
         if len(self.all_3d_points) < 5:
             return None, None, 0.0

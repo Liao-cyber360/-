@@ -158,7 +158,8 @@ class DualVideoWidget(QWidget):
     frame2_clicked = pyqtSignal(int, int)  # 相机2点击
     play_pause_clicked = pyqtSignal()
     stop_clicked = pyqtSignal()
-    seek_requested = pyqtSignal(int)  # 跳转到指定帧
+    seek_requested = pyqtSignal(int)       # 跳转到指定帧
+    seek_preview = pyqtSignal(int)         # 拖拽时预览帧
     
     def __init__(self):
         super().__init__()
@@ -168,6 +169,9 @@ class DualVideoWidget(QWidget):
         self.current_frame_number = 0
         self.total_frames = 0
         self.fps = 30
+        self.is_network_camera = False      # 网络摄像头模式
+        self.is_dragging = False           # 是否正在拖拽
+        self.drag_preview_enabled = True   # 拖拽预览功能
         
         self.setup_ui()
         self.setup_connections()
@@ -211,6 +215,26 @@ class DualVideoWidget(QWidget):
         """)
         control_layout = QVBoxLayout(control_frame)
         
+        # 进度滑块区域
+        progress_container = QVBoxLayout()
+        
+        # 时间显示标签（拖拽时显示）
+        self.time_display_label = QLabel("")
+        self.time_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.time_display_label.setStyleSheet("""
+            QLabel {
+                color: #2196F3;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 2px 8px;
+                background-color: rgba(33, 150, 243, 0.1);
+                border-radius: 3px;
+                border: 1px solid #2196F3;
+            }
+        """)
+        self.time_display_label.hide()  # 默认隐藏
+        progress_container.addWidget(self.time_display_label)
+        
         # 进度滑块
         self.progress_slider = QSlider(Qt.Orientation.Horizontal)
         self.progress_slider.setMinimum(0)
@@ -219,24 +243,36 @@ class DualVideoWidget(QWidget):
         self.progress_slider.setStyleSheet("""
             QSlider::groove:horizontal {
                 border: 1px solid #bbb;
-                height: 10px;
+                height: 12px;
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #fff, stop:1 #ddd);
                 margin: 2px 0;
-                border-radius: 5px;
+                border-radius: 6px;
             }
             QSlider::handle:horizontal {
                 background: #4CAF50;
-                border: 1px solid #5c5c5c;
-                width: 18px;
-                margin: -2px 0;
-                border-radius: 9px;
+                border: 2px solid #2196F3;
+                width: 20px;
+                margin: -4px 0;
+                border-radius: 10px;
             }
             QSlider::handle:horizontal:hover {
                 background: #45a049;
+                border: 2px solid #1976D2;
+            }
+            QSlider::handle:horizontal:pressed {
+                background: #3d8b40;
+                border: 2px solid #0D47A1;
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #66BB6A, stop:1 #4CAF50);
+                border-radius: 6px;
             }
         """)
-        control_layout.addWidget(self.progress_slider)
+        progress_container.addWidget(self.progress_slider)
+        
+        control_layout.addLayout(progress_container)
         
         # 播放控制按钮
         button_layout = QHBoxLayout()
@@ -310,8 +346,12 @@ class DualVideoWidget(QWidget):
         # 播放控制
         self.play_pause_btn.clicked.connect(self.on_play_pause_clicked)
         self.stop_btn.clicked.connect(self.on_stop_clicked)
+        
+        # 进度条增强功能
         self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
         self.progress_slider.sliderReleased.connect(self.on_slider_released)
+        self.progress_slider.valueChanged.connect(self.on_slider_value_changed)
+        self.progress_slider.sliderMoved.connect(self.on_slider_moved)
     
     def update_frames(self, frame1=None, frame2=None):
         """更新双路视频帧"""
@@ -364,13 +404,36 @@ class DualVideoWidget(QWidget):
         self.stop_clicked.emit()
     
     def on_slider_pressed(self):
-        """进度条按下"""
-        pass
+        """进度条按下 - 开始拖拽"""
+        if not self.is_network_camera:  # 网络摄像头模式禁用拖拽
+            self.is_dragging = True
+            self.time_display_label.show()
+            self.update_time_display()
     
     def on_slider_released(self):
-        """进度条释放"""
-        frame_number = self.progress_slider.value()
-        self.seek_requested.emit(frame_number)
+        """进度条释放 - 结束拖拽并跳转"""
+        if not self.is_network_camera and self.is_dragging:
+            self.is_dragging = False
+            self.time_display_label.hide()
+            frame_number = self.progress_slider.value()
+            self.seek_requested.emit(frame_number)
+    
+    def on_slider_value_changed(self, value):
+        """进度条值改变 - 更新显示但不跳转"""
+        if not self.is_dragging:  # 只有非拖拽时才更新帧号
+            self.current_frame_number = value
+            self.update_frame_info()
+    
+    def on_slider_moved(self, value):
+        """进度条拖拽移动 - 实时预览"""
+        if not self.is_network_camera and self.is_dragging:
+            self.current_frame_number = value
+            self.update_frame_info()
+            self.update_time_display()
+            
+            # 发送预览信号（可选功能）
+            if self.drag_preview_enabled:
+                self.seek_preview.emit(value)
     
     def clear_display(self):
         """清空显示"""
@@ -380,6 +443,86 @@ class DualVideoWidget(QWidget):
         self.total_frames = 0
         self.set_playing_state(False)
         self.update_frame_info()
+    
+    def update_time_display(self):
+        """更新时间显示"""
+        if self.total_frames > 0 and self.fps > 0:
+            current_seconds = self.current_frame_number / self.fps
+            total_seconds = self.total_frames / self.fps
+            
+            current_time = self.format_time(current_seconds)
+            total_time = self.format_time(total_seconds)
+            
+            self.time_display_label.setText(f"{current_time} / {total_time}")
+    
+    def format_time(self, seconds):
+        """格式化时间显示"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
+    def set_network_camera_mode(self, is_network=True):
+        """设置网络摄像头模式"""
+        self.is_network_camera = is_network
+        
+        if is_network:
+            # 网络摄像头模式：禁用进度条拖拽
+            self.progress_slider.setEnabled(False)
+            self.progress_slider.setStyleSheet("""
+                QSlider::groove:horizontal {
+                    border: 1px solid #ccc;
+                    height: 12px;
+                    background: #f0f0f0;
+                    margin: 2px 0;
+                    border-radius: 6px;
+                }
+                QSlider::handle:horizontal {
+                    background: #999;
+                    border: 2px solid #666;
+                    width: 20px;
+                    margin: -4px 0;
+                    border-radius: 10px;
+                }
+            """)
+            self.frame_info_label.setText("Network Camera Mode")
+        else:
+            # 本地视频模式：启用进度条拖拽
+            self.progress_slider.setEnabled(True)
+            self.progress_slider.setStyleSheet("""
+                QSlider::groove:horizontal {
+                    border: 1px solid #bbb;
+                    height: 12px;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #fff, stop:1 #ddd);
+                    margin: 2px 0;
+                    border-radius: 6px;
+                }
+                QSlider::handle:horizontal {
+                    background: #4CAF50;
+                    border: 2px solid #2196F3;
+                    width: 20px;
+                    margin: -4px 0;
+                    border-radius: 10px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #45a049;
+                    border: 2px solid #1976D2;
+                }
+                QSlider::handle:horizontal:pressed {
+                    background: #3d8b40;
+                    border: 2px solid #0D47A1;
+                }
+                QSlider::sub-page:horizontal {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #66BB6A, stop:1 #4CAF50);
+                    border-radius: 6px;
+                }
+            """)
     
     def set_camera_status(self, camera_id, status):
         """设置相机状态"""
