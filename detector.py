@@ -917,7 +917,7 @@ class StereoProcessor:
         """获取多球状态信息"""
         return self.multi_ball_tracker.get_balls_summary()
 
-    def find_best_trajectory_for_prediction_legacy(self, current_time)::
+    def find_best_trajectory_for_prediction_legacy(self, current_time):
         """找到最适合预测的轨迹片段 - 记录被排除的低质量点"""
         if len(self.all_3d_points) < 5:
             return None, None, 0.0
