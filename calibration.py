@@ -780,24 +780,8 @@ class BadmintonCalibrator:
                 break
         cv2.destroyWindow("Calibration Guide")
 
-        # 获取第一帧
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Error: Could not open video file {video_path}")
-            return None
-
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            print(f"Error: Could not read frame from {video_path}")
-            return None
-
-        # 让用户选择初始场地边界
-        masked_frame, mask, boundary_points = self.select_initial_court_boundary(frame)
-
-        # 获取更多帧并处理
-        processed_frames, detected_corners, _ = self.capture_and_process_frames(video_path, num_frames=20)
+        # 直接调用capture_and_process_frames获取处理帧和检测到的角点
+        processed_frames, detected_corners, boundary_points = self.capture_and_process_frames(video_path, num_frames=20)
 
         if not processed_frames or not detected_corners:
             print("Error: Failed to process frames or detect corners")

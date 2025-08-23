@@ -1,562 +1,1132 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Must be set before importing other libraries!
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import cv2
 import numpy as np
 import time
 import argparse
-from collections import deque
+from enum import Enum
 
-# Import custom modules
-from utils import config, UIHelper, CourtVisualizer
+from utils import config, UIHelper
 from calibration import calibrate_cameras
-from detector import ShuttlecockDetector, StereoProcessor
+from detector import BufferedImageProcessor, StereoProcessor
 from predictor import TrajectoryPredictor, CourtBoundaryAnalyzer
+from visualization_3d import Interactive3DVisualizer
 
 
-class BadmintonSystem:
-    """羽毛球落点预测与界内判定系统"""
+class SystemState(Enum):
+    """系统状态枚举"""
+    BUFFERING = "buffering"
+    PROCESSING = "processing"
+    PREDICTION_READY = "prediction_ready"
+    PREDICTION_COMPLETE = "prediction_complete"
+
+
+class BufferedBadmintonSystem:
+    """基于图像缓冲的羽毛球落点预测系统 - 完全修复版"""
 
     def __init__(self):
         """初始化系统"""
-        # 视频路径
+        self.state = SystemState.BUFFERING
+        self.running = False
+        self.calibration_done = False
+
+        # 视频和相机参数
         self.video_path1 = None
         self.video_path2 = None
-
-        # 相机标定文件
         self.camera1_params_file = None
         self.camera2_params_file = None
 
-        # 检测器
-        self.detector1 = None
-        self.detector2 = None
-
-        # 双目处理器
+        # 核心模块
+        self.buffered_processor = None
         self.stereo_processor = None
-
-        # 轨迹预测器
         self.trajectory_predictor = None
-
-        # 场地边界分析器
         self.court_analyzer = None
-
-        # 场地可视化器
-        self.court_visualizer = None
-
-        # 系统状态
-        self.running = False
-        self.calibration_done = False
-        self.prediction_requested = False
-        self.prediction_in_progress = False
-        self.prediction_result = None
+        self.interactive_3d_viz = None
 
         # 视频捕获
         self.cap1 = None
         self.cap2 = None
 
-        # 视频帧计数
-        self.frame_count1 = 0
-        self.frame_count2 = 0
-
         # 帧率控制
+        self.video_fps = 30.0
+        self.frame_time = 1.0 / self.video_fps
+        self.last_frame_time = 0
+        self.playback_speed = 1.0
+
+        # 暂停控制 - 增强状态管理
+        self.paused = False
+        self.pause_requested = False
+
+        # 数据和状态
+        self.frame_count = 0
+        self.actual_fps = 0
         self.fps_counter = 0
         self.fps_prev_time = time.time()
-        self.fps = 0
 
-        # 时间戳数据
-        self.timestamps1 = []
-        self.timestamps2 = []
+        # 预测结果和控制 - 增强管理
+        self.prediction_result = None
+        self.last_prediction_time = 0
+        self.prediction_cooldown = 2.0  # 减少冷却时间
+        self.processing_lock = False  # 处理锁标志
 
-    def initialize_system(self, video_path1, video_path2, 
-                          timestamps_file1=None, timestamps_file2=None):
-        """初始化系统"""
-        print("Initializing system...")
+        # 轨迹数据保存
+        self.current_trajectory_data = None
 
-        # 显示启动画面
+        # 当前帧缓存（用于显示）
+        self.current_frame1 = None
+        self.current_frame2 = None
+
+        # 系统性能监控
+        self.system_start_time = time.time()
+        self.total_predictions = 0
+        self.successful_predictions = 0
+
+        print("=" * 80)
+        print("Enhanced Buffered Badminton System v5.1 - Fully Fixed Architecture")
+        print(f"Initialized at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"Current User: Liao-cyber360")
+        print("Key Features: Robust 3D visualization, Enhanced state management")
+        print("=" * 80)
+
+    def initialize_system(self, video_path1, video_path2):
+        """初始化系统 - 增强版本"""
+        print("🚀 Initializing enhanced buffered badminton analysis system...")
+
         UIHelper.display_splash_screen(3)
 
-        # 存储视频路径
         self.video_path1 = video_path1
         self.video_path2 = video_path2
 
-        # 加载时间戳
-        if timestamps_file1 and timestamps_file2:
-            self.load_timestamps(timestamps_file1, timestamps_file2)
+        # 验证视频文件
+        if not os.path.exists(video_path1):
+            raise FileNotFoundError(f"Video file not found: {video_path1}")
+        if not os.path.exists(video_path2):
+            raise FileNotFoundError(f"Video file not found: {video_path2}")
 
         # 打开视频捕获
         self.cap1 = cv2.VideoCapture(video_path1)
         self.cap2 = cv2.VideoCapture(video_path2)
 
-        # 检查视频是否成功打开
         if not self.cap1.isOpened():
-            raise ValueError(f"Could not open video file: {video_path1}")
+            raise ValueError(f"Cannot open video file: {video_path1}")
         if not self.cap2.isOpened():
-            raise ValueError(f"Could not open video file: {video_path2}")
+            raise ValueError(f"Cannot open video file: {video_path2}")
 
-        # 创建检测器
-        self.detector1 = ShuttlecockDetector(config.yolo_ball_model, camera_id=0)
-        self.detector2 = ShuttlecockDetector(config.yolo_ball_model, camera_id=1)
+        # 获取视频信息
+        fps1 = self.cap1.get(cv2.CAP_PROP_FPS)
+        fps2 = self.cap2.get(cv2.CAP_PROP_FPS)
+        frame_count1 = int(self.cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_count2 = int(self.cap2.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # 创建双目处理器
-        self.stereo_processor = StereoProcessor()
+        self.video_fps = min(fps1, fps2) if fps1 > 0 and fps2 > 0 else 30.0
+        self.frame_time = 1.0 / self.video_fps
 
-        # 创建轨迹预测器
-        self.trajectory_predictor = TrajectoryPredictor()
+        print(f"📹 Video Information:")
+        print(f"   Camera 1: {fps1:.1f} FPS, {frame_count1} frames")
+        print(f"   Camera 2: {fps2:.1f} FPS, {frame_count2} frames")
+        print(f"   Using playback FPS: {self.video_fps:.1f}")
 
-        # 创建场地边界分析器
-        self.court_analyzer = CourtBoundaryAnalyzer()
+        # 初始化核心模块
+        print("🔧 Initializing core modules...")
 
-        # 创建场地可视化器
-        self.court_visualizer = CourtVisualizer(
-            width=config.court_view_width,
-            height=config.court_view_height
+        # 缓冲处理器
+        self.buffered_processor = BufferedImageProcessor(
+            config.yolo_ball_model,
+            buffer_duration=5.0,
+            fps=self.video_fps
         )
 
-        print("System initialization complete!")
+        # 双目处理器
+        self.stereo_processor = StereoProcessor()
+
+        # 轨迹预测器
+        self.trajectory_predictor = TrajectoryPredictor()
+
+        # 场地分析器
+        self.court_analyzer = CourtBoundaryAnalyzer()
+
+        # 3D可视化器 - 使用增强版本
+        self.interactive_3d_viz = Interactive3DVisualizer()
+        self.interactive_3d_viz.start()
+
+        print("✅ Enhanced system initialization complete!")
+        print(f"📊 System ready for operation at {time.strftime('%H:%M:%S')} UTC")
         return True
 
-    def load_timestamps(self, file1, file2):
-        """加载时间戳文件"""
-        self.timestamps1 = self._read_timestamp_file(file1)
-        self.timestamps2 = self._read_timestamp_file(file2)
-
-        print(f"Loaded {len(self.timestamps1)} timestamps for camera 1")
-        print(f"Loaded {len(self.timestamps2)} timestamps for camera 2")
-
-    def _read_timestamp_file(self, file_path):
-        """读取时间戳文件"""
-        timestamps = []
-        try:
-            with open(file_path, 'r') as f:
-                for line in f:
-                    ts = line.strip()
-                    if ts:
-                        timestamps.append(int(ts))
-            return timestamps
-        except Exception as e:
-            print(f"Error reading timestamp file {file_path}: {e}")
-            return []
-
     def calibration_mode(self):
-        """相机标定模式"""
-        print("Starting camera calibration mode...")
+        """相机标定模式 - 增强错误处理"""
+        print("🎯 Starting enhanced camera calibration...")
 
-        # 创建输出目录
         output_dir = os.path.join(config.results_dir, "calibration")
         os.makedirs(output_dir, exist_ok=True)
 
-        # 执行标定
         try:
             extrinsic_file1, extrinsic_file2 = calibrate_cameras(
                 self.video_path1, self.video_path2, output_dir
             )
 
-            # 保存标定文件路径
+            if not extrinsic_file1 or not extrinsic_file2:
+                raise ValueError("Calibration files not generated properly")
+
             self.camera1_params_file = extrinsic_file1
             self.camera2_params_file = extrinsic_file2
 
-            # 加载标定结果到检测器
-            self.detector1.load_camera_params(extrinsic_file1)
-            self.detector2.load_camera_params(extrinsic_file2)
+            # 验证标定文件
+            if not os.path.exists(extrinsic_file1) or not os.path.exists(extrinsic_file2):
+                raise FileNotFoundError("Calibration files not found after generation")
 
-            # 加载标定结果到双目处理器
-            self.stereo_processor.load_camera_parameters(extrinsic_file1, extrinsic_file2)
+            # 加载标定结果
+            success = self.stereo_processor.load_camera_parameters(extrinsic_file1, extrinsic_file2)
+            if not success:
+                raise ValueError("Failed to load calibration parameters")
 
-            # 更新标定状态
             self.calibration_done = True
-
-            print("Calibration completed successfully!")
+            print("✅ Camera calibration completed successfully!")
+            print(f"   Camera 1 params: {extrinsic_file1}")
+            print(f"   Camera 2 params: {extrinsic_file2}")
             return True
 
         except Exception as e:
-            print(f"Calibration failed: {e}")
+            print(f"❌ Calibration failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-    # 在 BadmintonSystem 类中的 predict_landing_point 方法中修改
-
-    def predict_landing_point(self):
-        """预测羽毛球落点"""
+    def load_existing_calibration(self, cam1_params, cam2_params):
+        """加载已有的标定参数 - 增强验证"""
         try:
-            # 标记预测状态
-            self.prediction_in_progress = True
-            print("Starting landing prediction process...")
+            # 验证文件存在
+            if not os.path.exists(cam1_params):
+                raise FileNotFoundError(f"Camera 1 parameters file not found: {cam1_params}")
+            if not os.path.exists(cam2_params):
+                raise FileNotFoundError(f"Camera 2 parameters file not found: {cam2_params}")
 
-            # 从两个相机获取最近的二维轨迹
-            trajectory1, timestamps1 = self.detector1.get_recent_trajectory(
-                config.prediction_time_window
+            print(f"📁 Loading calibration parameters...")
+            print(f"   Camera 1: {cam1_params}")
+            print(f"   Camera 2: {cam2_params}")
+
+            self.camera1_params_file = cam1_params
+            self.camera2_params_file = cam2_params
+
+            success = self.stereo_processor.load_camera_parameters(cam1_params, cam2_params)
+            if not success:
+                raise ValueError("Failed to load camera parameters into stereo processor")
+
+            self.calibration_done = True
+            print("✅ Existing calibration parameters loaded successfully!")
+            return True
+
+        except Exception as e:
+            print(f"❌ Failed to load calibration parameters: {e}")
+            return False
+
+    def _on_processing_complete(self, detections1, detections2, timestamps, frames1, frames2):
+        """处理完成回调 - 完全重写修复"""
+        try:
+            print("🔄 Processing buffered frames...")
+            current_time = time.time()
+
+            # 批量生成3D点
+            points_3d, timestamps_3d = self.stereo_processor.process_batch_detections(
+                detections1, detections2, timestamps
             )
 
-            trajectory2, timestamps2 = self.detector2.get_recent_trajectory(
-                config.prediction_time_window
-            )
+            # 获取调试数据
+            debug_data = self.stereo_processor.get_debug_data()
 
-            # 检查是否有足够的点
-            if len(trajectory1) < 5 or len(trajectory2) < 5:
-                print(
-                    f"Not enough trajectory points for prediction: camera1={len(trajectory1)}, camera2={len(trajectory2)} points")
-                self.prediction_in_progress = False
-                return None, None
+            # 找到最佳轨迹片段
+            best_trajectory, best_timestamps, confidence = \
+                self.stereo_processor.find_best_trajectory_for_prediction(current_time)
 
-            # 1. 筛选出目标场地上方的轨迹点
-            print("Filtering trajectories to focus on the target court...")
-            filtered_traj1, filtered_ts1, filtered_traj2, filtered_ts2 = self.stereo_processor.filter_trajectory_by_court(
-                trajectory1, timestamps1, trajectory2, timestamps2
-            )
+            if best_trajectory is None or confidence < 0.3:
+                print(f"❌ Trajectory quality insufficient for prediction (confidence: {confidence:.2f})")
+                self._handle_prediction_failure(debug_data, "Insufficient trajectory quality")
+                return
 
-            # 检查筛选后是否有足够的点
-            if len(filtered_traj1) < 5 or len(filtered_traj2) < 5:
-                print(
-                    f"Not enough valid trajectory points after filtering: camera1={len(filtered_traj1)}, camera2={len(filtered_traj2)} points")
-                # 尝试使用原始轨迹
-                filtered_traj1, filtered_ts1 = trajectory1, timestamps1
-                filtered_traj2, filtered_ts2 = trajectory2, timestamps2
+            print(f"✅ Found quality trajectory: {len(best_trajectory)} points, confidence: {confidence:.2f}")
 
-            # 2. 对二维轨迹进行三维重建
-            print("Reconstructing 3D trajectory...")
-            trajectory_3d, timestamps_3d = self.stereo_processor.reconstruct_3d_trajectory(
-                filtered_traj1, filtered_ts1, filtered_traj2, filtered_ts2
-            )
+            # 执行预测
+            self.state = SystemState.PROCESSING
+            self.total_predictions += 1
 
-            # 检查是否成功重建3D轨迹
-            if len(trajectory_3d) < 5:
-                print(f"Failed to reconstruct 3D trajectory, only {len(trajectory_3d)} points available")
-                self.prediction_in_progress = False
-                return None, None
+            prediction_result = self._predict_landing_point(best_trajectory, best_timestamps, confidence)
 
-            # 3. 识别自然下落段
-            print("Identifying natural falling segment...")
-            natural_segment, natural_timestamps = self.detector1.identify_natural_falling_segment(
-                trajectory_3d, timestamps_3d
-            )
+            if prediction_result is not None:
+                self.successful_predictions += 1
+                self._handle_prediction_success(
+                    prediction_result, best_trajectory, best_timestamps,
+                    confidence, points_3d, timestamps_3d, debug_data
+                )
+            else:
+                print("❌ Landing prediction computation failed")
+                self._handle_prediction_failure(debug_data, "Prediction computation failed")
 
-            if len(natural_segment) < 5:
-                print("No suitable natural falling segment identified, using entire trajectory")
-                natural_segment, natural_timestamps = trajectory_3d, timestamps_3d
+        except Exception as e:
+            print(f"❌ Critical error in processing callback: {e}")
+            import traceback
+            traceback.print_exc()
+            self._handle_prediction_failure({}, f"Critical error: {str(e)}")
 
-            # 4. 使用轨迹预测器预测落点
-            print("Predicting landing point using natural falling segment...")
-            landing_position, landing_time, trajectory = self.trajectory_predictor.predict_landing_point(
-                natural_segment, natural_timestamps
-            )
+    def _handle_prediction_success(self, prediction_result, best_trajectory, best_timestamps,
+                                   confidence, points_3d, timestamps_3d, debug_data):
+        """处理预测成功 - 增强版本"""
+        try:
+            landing_position, in_bounds = prediction_result
+            self.state = SystemState.PREDICTION_COMPLETE
+
+            # 保存完整轨迹数据
+            self.current_trajectory_data = {
+                'trajectory': best_trajectory,
+                'timestamps': best_timestamps,
+                'confidence': confidence,
+                'all_points_3d': points_3d,
+                'all_timestamps_3d': timestamps_3d,
+                'debug_data': debug_data,
+                'prediction_result': self.prediction_result,
+                'prediction_time': time.time(),
+                'success': True
+            }
+
+            # 准备调试数据用于可视化
+            debug_data['prediction_points'] = best_trajectory
+            debug_data['prediction_timestamps'] = best_timestamps
+
+            # 更新3D可视化（如果存在）
+            if self.interactive_3d_viz:
+                try:
+                    self.interactive_3d_viz.update_debug_data(debug_data)
+
+                    predicted_trajectory = self.prediction_result.get('trajectory', [])
+                    self.interactive_3d_viz.update_predicted_trajectory(predicted_trajectory)
+                    self.interactive_3d_viz.update_landing_point(landing_position, in_bounds)
+
+                    print("✅ 3D visualization updated successfully")
+                except Exception as viz_error:
+                    print(f"⚠️ 3D visualization update error (non-critical): {viz_error}")
+
+            # 显示预测结果
+            self._display_prediction_result(landing_position, in_bounds, confidence)
+
+            # 打印详细调试信息
+            self._print_detailed_debug_info(debug_data, best_trajectory,
+                                            self.prediction_result.get('trajectory', []))
+
+        except Exception as e:
+            print(f"❌ Error handling prediction success: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 确保状态被重置
+            self._reset_processing_state()
+
+    def _handle_prediction_failure(self, debug_data, reason="Unknown"):
+        """处理预测失败 - 增强版本"""
+        try:
+            print(f"❌ Prediction failed: {reason}")
+
+            # 保存失败数据用于调试
+            self.current_trajectory_data = {
+                'success': False,
+                'failure_reason': reason,
+                'debug_data': debug_data,
+                'failure_time': time.time()
+            }
+
+            # 更新3D可视化显示调试数据但没有预测轨迹
+            if self.interactive_3d_viz:
+                try:
+                    debug_data['prediction_points'] = []
+                    debug_data['prediction_timestamps'] = []
+                    self.interactive_3d_viz.update_debug_data(debug_data)
+                    self.interactive_3d_viz.update_predicted_trajectory([])
+
+                    # 打印调试统计
+                    self._print_detailed_debug_info(debug_data, [], [])
+                except Exception as viz_error:
+                    print(f"⚠️ 3D visualization error during failure handling: {viz_error}")
+
+        except Exception as e:
+            print(f"❌ Error handling prediction failure: {e}")
+        finally:
+            # 确保状态被重置
+            self._reset_processing_state()
+
+    def _reset_processing_state(self):
+        """重置处理状态 - 集中化管理"""
+        try:
+            # 重置系统状态
+            self.state = SystemState.BUFFERING
+            self.processing_lock = False
+
+            # 重置缓冲处理器状态
+            if self.buffered_processor:
+                self.buffered_processor.is_processing = False
+
+            print("🔄 Processing state reset to BUFFERING")
+
+        except Exception as e:
+            print(f"⚠️ Error resetting processing state: {e}")
+            # 强制重置关键状态
+            self.state = SystemState.BUFFERING
+            self.processing_lock = False
+
+    def _predict_landing_point(self, trajectory_points, trajectory_timestamps, confidence):
+        """预测羽毛球落地点 - 增强错误处理"""
+        try:
+            print(f"🎯 Starting landing point prediction...")
+            print(f"   Input points: {len(trajectory_points)}")
+            print(f"   Time span: {trajectory_timestamps[-1] - trajectory_timestamps[0]:.3f}s")
+
+            landing_position, landing_time, predicted_trajectory = \
+                self.trajectory_predictor.predict_landing_point(trajectory_points, trajectory_timestamps)
 
             if landing_position is None:
-                print("Landing prediction failed")
-                self.prediction_in_progress = False
-                return None, None
+                print("❌ Trajectory predictor returned None")
+                return None
 
-            print(f"Predicted landing position: {landing_position}")
-
-            # 判断是否界内 (默认单打)
-            in_bounds = self.court_analyzer.is_point_in_court(landing_position, 'singles')
-            print(f"Landing point is {'IN' if in_bounds else 'OUT'} of bounds")
+            # 判断是否在界内
+            in_bounds = self.court_analyzer.is_point_in_court(landing_position, game_type='singles')
 
             # 保存预测结果
             self.prediction_result = {
                 'landing_point': landing_position,
                 'landing_time': landing_time,
-                'trajectory': trajectory,
-                'in_bounds': in_bounds
+                'trajectory': predicted_trajectory,
+                'in_bounds': in_bounds,
+                'confidence': confidence,
+                'prediction_timestamp': time.time()
             }
 
-            # 显示预测结果
-            UIHelper.show_prediction_result(landing_position, in_bounds)
+            print(f"✅ Prediction computed successfully")
+            print(f"   Landing point: ({landing_position[0]:.1f}, {landing_position[1]:.1f})")
+            print(f"   Trajectory points: {len(predicted_trajectory) if predicted_trajectory else 0}")
 
-            # 重置预测状态
-            self.prediction_in_progress = False
-            self.prediction_requested = False
-
-            # 返回结果
             return landing_position, in_bounds
 
         except Exception as e:
+            print(f"❌ Error in landing point prediction: {e}")
             import traceback
-            print(f"Error in predict_landing_point: {e}")
-            print(traceback.format_exc())
-            self.prediction_in_progress = False
-            self.prediction_requested = False
-            return None, None
+            traceback.print_exc()
+            return None
+
+    def _display_prediction_result(self, landing_position, in_bounds, confidence):
+        """显示预测结果 - 增强版本"""
+        current_time = time.strftime('%H:%M:%S')
+
+        print(f"\n{'=' * 60}")
+        print(f"🎯 PREDICTION RESULT - {current_time} UTC")
+        print(f"{'=' * 60}")
+        print(f"📍 Landing Position: ({landing_position[0]:.1f}, {landing_position[1]:.1f}) cm")
+        print(f"🏆 Status: {'✅ IN BOUNDS' if in_bounds else '❌ OUT OF BOUNDS'}")
+        print(f"🎲 Confidence: {confidence:.2f}")
+        print(f"📊 Session Stats: {self.successful_predictions}/{self.total_predictions} successful")
+
+        # 显示调试信息摘要
+        if self.current_trajectory_data and 'debug_data' in self.current_trajectory_data:
+            debug_data = self.current_trajectory_data['debug_data']
+            print(f"\n📊 Debug Summary:")
+            print(f"   Valid points used: {len(debug_data.get('all_valid_points', []))}")
+            print(f"   Trajectory points: {len(debug_data.get('prediction_points', []))}")
+            print(f"   Rejected points: {len(debug_data.get('rejected_points', []))}")
+
+        print(f"\n📋 Available Actions:")
+        print(f"   V - Open 3D visualization with full debug data")
+        print(f"   D - Print detailed debug statistics")
+        print(f"   P - Resume video playback")
+        print(f"   R - Reset system for new analysis")
+        print(f"   1-6 - Toggle point types in 3D view (when open)")
+        print(f"{'=' * 60}")
+
+    def _print_detailed_debug_info(self, debug_data, selected_trajectory, predicted_trajectory):
+        """打印详细调试信息 - 增强版本"""
+        print(f"\n📊 DETAILED DEBUG ANALYSIS:")
+        print(f"{'─' * 50}")
+
+        # 数据统计
+        all_points = len(debug_data.get('all_valid_points', []))
+        selected_points = len(selected_trajectory) if selected_trajectory else 0
+        predicted_points = len(predicted_trajectory) if predicted_trajectory else 0
+        rejected_points = len(debug_data.get('rejected_points', []))
+        low_quality = len(debug_data.get('low_quality_points', []))
+        failed_triangulation = len(debug_data.get('triangulation_failed_points', []))
+
+        print(f"📈 Data Statistics:")
+        print(f"   All valid points (150 frames): {all_points}")
+        print(f"   Selected for prediction: {selected_points}")
+        print(f"   Predicted trajectory points: {predicted_points}")
+        print(f"   Rejected (out-of-bounds): {rejected_points}")
+        print(f"   Low quality: {low_quality}")
+        print(f"   Failed triangulation: {failed_triangulation}")
+
+        # 轨迹质量分析
+        if selected_trajectory and len(selected_trajectory) > 1:
+            points = np.array(selected_trajectory)
+            distances = [np.linalg.norm(points[i] - points[i - 1]) for i in range(1, len(points))]
+            z_range = np.max(points[:, 2]) - np.min(points[:, 2])
+
+            print(f"\n🎯 Selected Trajectory Quality:")
+            print(f"   Average point distance: {np.mean(distances):.1f} cm")
+            print(f"   Height range: {z_range:.1f} cm")
+            print(f"   Initial height: {points[0, 2]:.1f} cm")
+            print(f"   Final height: {points[-1, 2]:.1f} cm")
+            print(f"   Height drop: {points[0, 2] - points[-1, 2]:.1f} cm")
+
+        # 预测轨迹分析
+        if predicted_trajectory and len(predicted_trajectory) > 0:
+            print(f"\n🎲 Prediction Analysis:")
+            print(f"   Predicted trajectory length: {len(predicted_trajectory)}")
+
+            if len(predicted_trajectory) > 1:
+                start_pos = predicted_trajectory[0]['position'] if isinstance(predicted_trajectory[0], dict) else \
+                predicted_trajectory[0]
+                end_pos = predicted_trajectory[-1]['position'] if isinstance(predicted_trajectory[-1], dict) else \
+                predicted_trajectory[-1]
+
+                horizontal_distance = np.linalg.norm(np.array(end_pos[:2]) - np.array(start_pos[:2]))
+                print(f"   Horizontal prediction distance: {horizontal_distance:.1f} cm")
+
+        print(f"{'─' * 50}")
 
     def start_processing(self):
-        """开始处理视频"""
+        """开始处理视频 - 完全重写的主循环"""
         if not self.calibration_done:
-            print("Warning: Cameras not calibrated. Functionality will be limited.")
+            print("⚠️ Warning: Cameras not calibrated. System may not work properly.")
+            return
 
-        # 创建显示窗口
-        cv2.namedWindow('Camera 1', cv2.WINDOW_NORMAL)
-        cv2.namedWindow('Camera 2', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Camera 1', 640, 480)
-        cv2.resizeWindow('Camera 2', 640, 480)
+        # 创建主显示窗口
+        cv2.namedWindow('Enhanced Badminton System - Live View', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Enhanced Badminton System - Live View', 1280, 640)
 
-        # 创建球场俯视窗口
-        cv2.namedWindow('Court View', cv2.WINDOW_NORMAL)
-        display_width = int(config.court_view_width * config.display_scale)
-        display_height = int(config.court_view_height * config.display_scale)
-        cv2.resizeWindow('Court View', display_width, display_height)
-
-        # 设置处理状态
+        # 初始化运行状态
         self.running = True
+        self.state = SystemState.BUFFERING
+        self.last_frame_time = time.time()
+        self.fps_prev_time = time.time()
 
-        # 重置帧计数
-        self.frame_count1 = 0
-        self.frame_count2 = 0
+        print(f"\n{'=' * 80}")
+        print(f"🚀 STARTING ENHANCED VIDEO PROCESSING at {self.video_fps:.1f} FPS")
+        print(f"Session started: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"User: Liao-cyber360")
+        print(f"{'=' * 80}")
 
-        # 重置检测器
-        if self.detector1 and self.detector2:
-            self.detector1.reset_trajectory()
-            self.detector2.reset_trajectory()
-
-        # 重置双目处理器
-        if self.stereo_processor:
-            self.stereo_processor.reset()
-
-        # 添加一个标志位，用于防止连续触发预测
-        self.last_prediction_time = 0
-        self.prediction_cooldown = 2.0  # 2秒冷却时间
+        self._print_control_instructions()
 
         # 主处理循环
-        while self.running:
-            # 读取帧
-            ret1, frame1 = self.cap1.read()
-            ret2, frame2 = self.cap2.read()
+        try:
+            while self.running:
+                loop_start_time = time.time()
 
-            if not ret1 and not ret2:
-                print("End of videos reached")
-                break
+                # 1. 处理暂停状态
+                if self.paused:
+                    self._handle_paused_state()
+                    continue
 
-            # 计算FPS
-            current_time = time.time()
-            self.fps_counter += 1
+                # 2. 帧率控制
+                if not self._should_process_frame(loop_start_time):
+                    # 在等待期间处理背景任务
+                    self._handle_background_tasks()
+                    continue
 
-            if current_time - self.fps_prev_time >= 1.0:
-                self.fps = self.fps_counter
-                self.fps_counter = 0
-                self.fps_prev_time = current_time
+                # 3. 读取和处理视频帧
+                if not self._process_video_frame():
+                    print("📹 End of video reached")
+                    break
 
-            # 获取时间戳
-            timestamp1 = current_time
-            timestamp2 = current_time
+                # 4. 更新显示
+                self._update_display()
 
-            if self.timestamps1 and self.frame_count1 < len(self.timestamps1):
-                timestamp1 = self.timestamps1[self.frame_count1]
+                # 5. 处理背景任务
+                self._handle_background_tasks()
 
-            if self.timestamps2 and self.frame_count2 < len(self.timestamps2):
-                timestamp2 = self.timestamps2[self.frame_count2]
+                # 6. 性能监控
+                self._monitor_performance()
 
-            # 处理相机1
-            shuttlecock_pos1 = None
-            landing1 = False
+        except KeyboardInterrupt:
+            print(f"\n{'=' * 80}")
+            print("⚠️ Program interrupted by user (Ctrl+C)")
+            print(f"Session ended: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            print(f"{'=' * 80}")
+        except Exception as e:
+            print(f"❌ Critical error in main processing loop: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._cleanup()
 
-            if ret1:
-                self.frame_count1 += 1
-                processed1, shuttlecock_pos1, landing1 = self.detector1.detect(frame1, timestamp1)
+    def _print_control_instructions(self):
+        """打印控制说明 - 完整版本"""
+        print("\n📋 ENHANCED SYSTEM CONTROLS:")
+        print("   ▶️  SPACE     - Pause/Resume video playback")
+        print("   🎯 T         - Trigger trajectory analysis (when paused)")
+        print("   ▶️  P         - Resume playback (when paused)")
+        print("   🔍 V         - Toggle 3D visualization window")
+        print("   ❌ Q         - Close 3D visualization window")
+        print("   📊 D         - Print detailed debug statistics")
+        print("   ❓ H         - Show complete help screen")
+        print("   🔄 R         - Complete system reset")
+        print("   ⏩ +/=       - Increase playback speed")
+        print("   ⏪ -/_       - Decrease playback speed")
+        print("   🔄 0         - Reset playback speed")
+        print("   🚪 ESC       - Exit program")
+        print("\n🔧 3D VISUALIZATION CONTROLS (when window open):")
+        print("   1 - Toggle all valid points (light green)")
+        print("   2 - Toggle prediction points (dark blue)")
+        print("   3 - Toggle rejected points (red)")
+        print("   4 - Toggle low quality points (orange)")
+        print("   5 - Toggle triangulation failed (gray)")
+        print("   6 - Toggle predicted trajectory (cyan line)")
+        print("\n💡 RECOMMENDED WORKFLOW:")
+        print("   1. Watch video → 2. SPACE to pause → 3. T to predict → 4. V for 3D → 5. P to resume")
+        print(f"{'=' * 80}")
 
-                # 添加状态栏
-                detection_status = (shuttlecock_pos1 is not None)
-                prediction_status = "idle"
-                if self.prediction_requested:
-                    prediction_status = "ready"
-                elif self.prediction_in_progress:
-                    prediction_status = "in_progress"
-                elif self.prediction_result:
-                    prediction_status = "completed"
+    def _handle_paused_state(self):
+        """处理暂停状态 - 优化版本"""
+        # 在暂停时仍需处理3D可视化和键盘事件
+        self._handle_background_tasks()
+        time.sleep(0.01)  # 小延迟避免CPU占用过高
 
-                processed1 = UIHelper.create_status_bar(
-                    processed1, self.fps, self.frame_count1,
-                    detection_status, prediction_status
-                )
+    def _should_process_frame(self, current_time):
+        """检查是否应该处理帧（帧率控制）"""
+        elapsed_since_last_frame = current_time - self.last_frame_time
+        target_frame_time = self.frame_time / self.playback_speed
+        return elapsed_since_last_frame >= target_frame_time
 
-                # 显示相机1帧
-                cv2.imshow('Camera 1', processed1)
+    def _process_video_frame(self):
+        """处理视频帧 - 增强版本"""
+        # 读取帧
+        ret1, frame1 = self.cap1.read()
+        ret2, frame2 = self.cap2.read()
 
-            # 处理相机2
-            shuttlecock_pos2 = None
-            landing2 = False
+        if not ret1 or not ret2:
+            return False
 
-            if ret2:
-                self.frame_count2 += 1
-                processed2, shuttlecock_pos2, landing2 = self.detector2.detect(frame2, timestamp2)
+        # 更新时间基准
+        self.last_frame_time = time.time()
 
-                # 添加状态栏
-                detection_status = (shuttlecock_pos2 is not None)
-                prediction_status = "idle"
-                if self.prediction_requested:
-                    prediction_status = "ready"
-                elif self.prediction_in_progress:
-                    prediction_status = "in_progress"
-                elif self.prediction_result:
-                    prediction_status = "completed"
+        # 更新帧计数和FPS
+        self.frame_count += 1
+        self._update_fps()
 
-                processed2 = UIHelper.create_status_bar(
-                    processed2, self.fps, self.frame_count2,
-                    detection_status, prediction_status
-                )
+        # 添加到缓冲区（只在缓冲状态且未处理时）
+        if self.state == SystemState.BUFFERING and not self.processing_lock:
+            self.buffered_processor.add_frame_pair(frame1, frame2, self.last_frame_time)
 
-                # 显示相机2帧
-                cv2.imshow('Camera 2', processed2)
+        # 保存当前帧用于显示
+        self.current_frame1 = frame1 if frame1 is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+        self.current_frame2 = frame2 if frame2 is not None else np.zeros((480, 640, 3), dtype=np.uint8)
 
-            # 双目处理 (如果两个相机都检测到了羽毛球)
-            if shuttlecock_pos1 is not None and shuttlecock_pos2 is not None:
-                # 使用最小的时间戳
-                timestamp = min(timestamp1, timestamp2)
-                point_3d = self.stereo_processor.process_stereo_points(shuttlecock_pos1, shuttlecock_pos2, timestamp)
+        return True
 
-            # 检测落地是否发生
-            if landing1 or landing2:
-                # 显示提示信息
-                self._show_landing_detection_prompt()
+    def _update_display(self):
+        """更新显示 - 增强版本"""
+        if hasattr(self, 'current_frame1') and hasattr(self, 'current_frame2'):
+            display_frame = self._create_display_frame(self.current_frame1, self.current_frame2)
+            if display_frame is not None:
+                cv2.imshow('Enhanced Badminton System - Live View', display_frame)
 
-            # 显示球场俯视图
-            if self.prediction_result:
-                court_view = self.court_visualizer.draw_trajectory_and_landing(
-                    self.prediction_result['trajectory'],
-                    self.prediction_result['landing_point'],
-                    self.prediction_result['in_bounds']
-                )
-            else:
-                court_view = self.court_visualizer.court_image.copy()
+    def _handle_background_tasks(self):
+        """处理背景任务 - 优化版本"""
+        # 1. 更新3D可视化（非阻塞）
+        if self.interactive_3d_viz:
+            try:
+                self.interactive_3d_viz.update_if_visible()
+            except Exception as e:
+                print(f"⚠️ 3D visualization background update error: {e}")
 
-            # 调整大小并显示
-            resized_court = cv2.resize(court_view, (display_width, display_height))
-            cv2.imshow('Court View', resized_court)
+        # 2. 处理键盘事件
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:  # 有按键
+            self._handle_keyboard_input(key, time.time())
 
-            # 处理按键事件
-            key = cv2.waitKey(1) & 0xFF
+    def _monitor_performance(self):
+        """性能监控"""
+        # 可以在这里添加性能监控逻辑
+        pass
 
-            # ESC退出
-            if key == 27:
-                self.running = False
+    def _handle_keyboard_input(self, key, current_time):
+        """统一的键盘事件处理 - 完全重写"""
+        if key == 27:  # ESC - 退出
+            self.running = False
+            print("🚪 Exit requested by user")
 
-            # 空格键触发落点预测
-            elif key == ord(' '):
-                # 检查是否在冷却期
-                if current_time - self.last_prediction_time > self.prediction_cooldown:
-                    self.prediction_requested = True
-                    # 直接调用预测方法
-                    landing_point, in_bounds = self.predict_landing_point()
-                    # 更新最后预测时间
-                    self.last_prediction_time = current_time
+        elif key == ord(' '):  # SPACE - 暂停/恢复播放
+            self._handle_space_key()
 
-            # H键显示帮助
-            elif key == ord('h'):
-                UIHelper.display_help_screen()
+        elif key == ord('t') or key == ord('T'):  # T - 触发预测
+            self._handle_prediction_trigger(current_time)
 
-            # R键重置轨迹
-            elif key == ord('r'):
-                self.detector1.reset_trajectory()
-                self.detector2.reset_trajectory()
+        elif key == ord('p') or key == ord('P'):  # P - 恢复播放
+            self._handle_resume_playback()
+
+        elif key == ord('v') or key == ord('V'):  # V - 切换3D可视化
+            self._handle_toggle_3d_visualization()
+
+        elif key == ord('q') or key == ord('Q'):  # Q - 关闭3D窗口
+            self._handle_close_3d_window()
+
+        elif key == ord('d') or key == ord('D'):  # D - 打印调试统计
+            self._handle_debug_statistics()
+
+        elif key == ord('h') or key == ord('H'):  # H - 帮助
+            UIHelper.display_help_screen()
+
+        elif key == ord('r') or key == ord('R'):  # R - 重置系统
+            self._handle_system_reset()
+
+        elif key == ord('+') or key == ord('='):  # 增加播放速度
+            self._handle_speed_change(1.2)
+
+        elif key == ord('-') or key == ord('_'):  # 减少播放速度
+            self._handle_speed_change(1 / 1.2)
+
+        elif key == ord('0'):  # 重置到正常速度
+            self._handle_speed_reset()
+
+        # 3D可视化元素切换
+        elif key in [ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6')]:
+            self._handle_3d_element_toggle(key)
+
+    def _handle_space_key(self):
+        """处理空格键 - 暂停/恢复"""
+        if self.paused:
+            print("\n📋 Video is paused. Choose action:")
+            print("   P - Resume playback")
+            print("   T - Trigger trajectory analysis and prediction")
+            print("   V - Open 3D visualization (if data available)")
+        else:
+            self.paused = True
+            print("⏸️  Video PAUSED")
+            print("   Press P to resume playback")
+            print("   Press T to analyze current trajectory")
+
+    def _handle_prediction_trigger(self, current_time):
+        """处理预测触发 - 增强版本"""
+        # 检查是否暂停
+        if not self.paused:
+            print("❌ Please pause video first (SPACE), then press T to predict")
+            return
+
+        # 检查系统状态
+        if self.processing_lock or self.state != SystemState.BUFFERING:
+            print("❌ System busy. Please wait for current operation to complete.")
+            return
+
+        # 检查冷却时间
+        if current_time - self.last_prediction_time < self.prediction_cooldown:
+            remaining_time = self.prediction_cooldown - (current_time - self.last_prediction_time)
+            print(f"⏱️ Prediction cooldown: {remaining_time:.1f}s remaining")
+            return
+
+        # 检查缓冲区
+        buffer_info = self.buffered_processor.get_buffer_info()
+        if buffer_info['buffer_size'] < 10:
+            print(f"❌ Insufficient buffered frames: {buffer_info['buffer_size']}/10 minimum")
+            return
+
+        # 设置处理锁和状态
+        self.processing_lock = True
+        self.last_prediction_time = current_time
+
+        # 触发处理
+        success = self.buffered_processor.trigger_processing(self._on_processing_complete)
+
+        if success:
+            self.state = SystemState.PROCESSING
+            print("🎯 TRAJECTORY ANALYSIS STARTED...")
+            print(f"   Processing {buffer_info['buffer_size']} buffered frames")
+            print("   Please wait for prediction results...")
+        else:
+            print("❌ Failed to start processing")
+            self.processing_lock = False
+
+    def _handle_resume_playback(self):
+        """处理恢复播放"""
+        if self.paused:
+            self.paused = False
+            self.last_frame_time = time.time()
+            print("▶️  Playback RESUMED")
+        else:
+            print("ℹ️  Video is already playing")
+
+    def _handle_toggle_3d_visualization(self):
+        """处理3D可视化切换"""
+        if not self.interactive_3d_viz:
+            print("❌ 3D visualizer not available")
+            return
+
+        if self.prediction_result or self.current_trajectory_data:
+            try:
+                self.interactive_3d_viz.toggle_window()
+            except Exception as e:
+                print(f"❌ Error toggling 3D visualization: {e}")
+        else:
+            print("❌ No prediction data available for 3D visualization")
+            print("   Please run trajectory analysis first (T key when paused)")
+
+    def _handle_close_3d_window(self):
+        """处理关闭3D窗口"""
+        if self.interactive_3d_viz and self.interactive_3d_viz.window_visible:
+            try:
+                self.interactive_3d_viz.close_window()
+                print("✅ 3D visualization window closed")
+            except Exception as e:
+                print(f"⚠️ Error closing 3D window: {e}")
+        else:
+            print("ℹ️  3D visualization window is not currently open")
+
+    def _handle_debug_statistics(self):
+        """处理调试统计打印"""
+        if self.interactive_3d_viz:
+            try:
+                self.interactive_3d_viz.print_debug_statistics()
+            except Exception as e:
+                print(f"❌ Error printing debug statistics: {e}")
+        else:
+            print("❌ 3D visualizer not available for debug statistics")
+
+    def _handle_system_reset(self):
+        """处理系统重置 - 完全重写"""
+        if self.processing_lock or self.state == SystemState.PROCESSING:
+            print("❌ Cannot reset while processing. Please wait.")
+            return
+
+        try:
+            print("🔄 Performing COMPLETE system reset...")
+
+            # 1. 关闭并重置3D可视化
+            if self.interactive_3d_viz:
+                if self.interactive_3d_viz.window_visible:
+                    self.interactive_3d_viz.close_window()
+                self.interactive_3d_viz.reset()
+
+            # 2. 重置缓冲处理器
+            if self.buffered_processor:
+                self.buffered_processor.clear_buffer()
+                # 强制重置处理状态
+                if hasattr(self.buffered_processor, 'force_reset_processing_state'):
+                    self.buffered_processor.force_reset_processing_state()
+                else:
+                    self.buffered_processor.is_processing = False
+
+            # 3. 重置双目处理器
+            if self.stereo_processor:
                 self.stereo_processor.reset()
-                self.prediction_result = None
-                print("Trajectory data reset")
 
-        # 清理资源
-        self._cleanup()
+            # 4. 清理系统状态
+            self.prediction_result = None
+            self.current_trajectory_data = None
+            self.state = SystemState.BUFFERING
+            self.processing_lock = False
 
-    def _show_landing_detection_prompt(self):
-        """显示落地检测提示"""
-        # 创建提示窗口
-        prompt = np.ones((200, 400, 3), dtype=np.uint8) * 240  # 灰色背景
+            # 5. 重置计数和时间
+            self.last_prediction_time = 0
+            self.last_frame_time = time.time()
 
-        # 添加标题和提示
-        cv2.putText(prompt, "Shuttlecock Landing Detected",
-                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # 6. 重置播放状态
+            if self.paused:
+                self.paused = False
+                print("▶️  Video playback resumed after reset")
 
-        cv2.putText(prompt, "Press SPACE to predict landing point",
-                    (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            print("✅ COMPLETE system reset successful")
+            print("📺 System ready for new trajectory analysis")
+            print(f"🔄 Reset completed at {time.strftime('%H:%M:%S')} UTC")
 
-        cv2.putText(prompt, "or wait 3 seconds to continue...",
-                    (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        except Exception as e:
+            print(f"⚠️ Error during system reset: {e}")
+            # 强制重置关键状态
+            self.state = SystemState.BUFFERING
+            self.processing_lock = False
+            if self.buffered_processor:
+                self.buffered_processor.is_processing = False
 
-        # 显示提示
-        cv2.namedWindow("Landing Detection", cv2.WINDOW_NORMAL)
-        cv2.moveWindow("Landing Detection", 500, 300)
-        cv2.imshow("Landing Detection", prompt)
+    def _handle_speed_change(self, factor):
+        """处理播放速度变化"""
+        self.playback_speed = max(0.1, min(5.0, self.playback_speed * factor))
+        print(f"⏩ Playback speed: {self.playback_speed:.1f}x")
 
-        # 等待响应
-        start_time = time.time()
-        while time.time() - start_time < 3.0:  # 最多显示3秒
-            key = cv2.waitKey(100)
-            if key == ord(' '):
-                self.prediction_requested = True
-                break
+    def _handle_speed_reset(self):
+        """重置播放速度"""
+        self.playback_speed = 1.0
+        print("▶️  Playback speed reset to 1.0x")
 
-        cv2.destroyWindow("Landing Detection")
+    def _handle_3d_element_toggle(self, key):
+        """处理3D元素切换"""
+        if not self.interactive_3d_viz:
+            print("❌ 3D visualizer not available")
+            return
+
+        element_map = {
+            ord('1'): 'all_valid',
+            ord('2'): 'prediction',
+            ord('3'): 'rejected',
+            ord('4'): 'low_quality',
+            ord('5'): 'triangulation_failed',
+            ord('6'): 'predicted_trajectory'
+        }
+
+        element_type = element_map.get(key)
+        if element_type:
+            try:
+                self.interactive_3d_viz.toggle_visualization_elements(element_type)
+            except Exception as e:
+                print(f"❌ Error toggling 3D element: {e}")
+
+    def _create_display_frame(self, frame1, frame2):
+        """创建显示帧 - 完全重写"""
+        if frame1 is None and frame2 is None:
+            return None
+
+        # 调整帧大小
+        display_height = 480
+        display_width = 640
+
+        if frame1 is not None:
+            frame1_resized = cv2.resize(frame1, (display_width, display_height))
+        else:
+            frame1_resized = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+
+        if frame2 is not None:
+            frame2_resized = cv2.resize(frame2, (display_width, display_height))
+        else:
+            frame2_resized = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+
+        # 水平拼接主视频
+        combined_frame = np.hstack([frame1_resized, frame2_resized])
+
+        # 创建增强状态栏
+        status_bar = self._create_enhanced_status_bar(combined_frame.shape[1])
+
+        # 垂直拼接
+        final_frame = np.vstack([combined_frame, status_bar])
+
+        return final_frame
+
+    def _create_enhanced_status_bar(self, width):
+        """创建增强状态栏"""
+        status_bar = np.zeros((160, width, 3), dtype=np.uint8)
+
+        # 系统状态显示
+        state_colors = {
+            SystemState.BUFFERING: (0, 255, 0),
+            SystemState.PROCESSING: (255, 255, 0),
+            SystemState.PREDICTION_READY: (255, 165, 0),
+            SystemState.PREDICTION_COMPLETE: (0, 255, 255)
+        }
+
+        state_color = state_colors.get(self.state, (255, 255, 255))
+        state_text = f"State: {self.state.value.upper()}"
+        if self.processing_lock:
+            state_text += " [LOCKED]"
+
+        cv2.putText(status_bar, state_text, (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
+
+        # 3D窗口状态
+        if self.interactive_3d_viz:
+            viz_status = "OPEN" if self.interactive_3d_viz.window_visible else "CLOSED"
+            viz_color = (0, 255, 255) if self.interactive_3d_viz.window_visible else (100, 100, 100)
+            cv2.putText(status_bar, f"3D Debug: {viz_status}", (350, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, viz_color, 2)
+
+        # 时间和用户信息
+        current_time_str = time.strftime('%H:%M:%S UTC')
+        cv2.putText(status_bar, f"Time: {current_time_str}", (650, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.putText(status_bar, f"User: Liao-cyber360", (900, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        # 缓冲区和性能信息
+        if self.buffered_processor:
+            buffer_info = self.buffered_processor.get_buffer_info()
+            cv2.putText(status_bar, f"Buffer: {buffer_info['buffer_size']}/{buffer_info['max_size']} frames",
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # 播放状态
+        if self.paused:
+            pause_text = "[⏸️  PAUSED - T:Predict P:Resume]"
+            pause_color = (0, 255, 255)
+        else:
+            pause_text = f"[▶️  PLAYING - Speed: {self.playback_speed:.1f}x]"
+            pause_color = (255, 255, 255)
+
+        cv2.putText(status_bar, pause_text, (350, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, pause_color, 1)
+
+        # FPS和帧信息
+        cv2.putText(status_bar, f"FPS: {self.actual_fps:.1f} | Frame: {self.frame_count}",
+                    (650, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # 预测统计
+        if self.total_predictions > 0:
+            success_rate = (self.successful_predictions / self.total_predictions) * 100
+            cv2.putText(status_bar,
+                        f"Predictions: {self.successful_predictions}/{self.total_predictions} ({success_rate:.1f}%)",
+                        (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 调试数据显示
+        if self.current_trajectory_data and 'debug_data' in self.current_trajectory_data:
+            debug_data = self.current_trajectory_data['debug_data']
+            debug_text = f"Debug: V:{len(debug_data.get('all_valid_points', []))} P:{len(debug_data.get('prediction_points', []))} R:{len(debug_data.get('rejected_points', []))}"
+            cv2.putText(status_bar, debug_text, (350, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        # 控制提示行1
+        if self.paused:
+            controls1 = "⏸️  PAUSED: T:Predict | P:Resume | V:3D | D:Debug | R:Reset | H:Help"
+        else:
+            controls1 = "▶️  PLAYING: SPACE:Pause | V:3D | D:Debug | R:Reset | H:Help"
+
+        cv2.putText(status_bar, controls1, (10, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # 控制提示行2
+        controls2 = "3D Controls: 1:AllValid 2:Prediction 3:Rejected 4:LowQuality 5:TriFailed 6:Trajectory"
+        cv2.putText(status_bar, controls2, (10, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 200, 255), 1)
+
+        # 控制提示行3
+        controls3 = "Playback: +/-:Speed 0:Reset | System: Q:Close3D ESC:Exit"
+        cv2.putText(status_bar, controls3, (10, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 200, 255), 1)
+
+        return status_bar
+
+    def _update_fps(self):
+        """更新FPS计算"""
+        current_time = time.time()
+        self.fps_counter += 1
+
+        if current_time - self.fps_prev_time >= 1.0:
+            self.actual_fps = self.fps_counter
+            self.fps_counter = 0
+            self.fps_prev_time = current_time
 
     def _cleanup(self):
-        """清理资源"""
-        # 释放视频捕获
-        if self.cap1 is not None:
-            self.cap1.release()
-        if self.cap2 is not None:
-            self.cap2.release()
+        """清理系统资源 - 增强版本"""
+        print("\n🔄 Cleaning up system resources...")
 
-        # 关闭所有窗口
-        cv2.destroyAllWindows()
+        try:
+            # 停止视频捕获
+            if self.cap1:
+                self.cap1.release()
+            if self.cap2:
+                self.cap2.release()
 
-        print("System shutdown complete")
+            # 停止3D可视化
+            if self.interactive_3d_viz:
+                self.interactive_3d_viz.stop()
+
+            # 关闭OpenCV窗口
+            cv2.destroyAllWindows()
+
+            # 打印会话统计
+            session_duration = time.time() - self.system_start_time
+            print(f"\n📊 SESSION STATISTICS:")
+            print(f"   Duration: {session_duration:.1f} seconds")
+            print(f"   Frames processed: {self.frame_count}")
+            print(f"   Predictions attempted: {self.total_predictions}")
+            print(f"   Successful predictions: {self.successful_predictions}")
+            if self.total_predictions > 0:
+                success_rate = (self.successful_predictions / self.total_predictions) * 100
+                print(f"   Success rate: {success_rate:.1f}%")
+
+        except Exception as e:
+            print(f"⚠️ Error during cleanup: {e}")
+
+        print("✅ System cleanup complete")
+        print(f"Session ended at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"User: Liao-cyber360")
 
 
 def parse_arguments():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="Badminton Shuttlecock Landing Prediction System")
+    parser = argparse.ArgumentParser(
+        description="Enhanced Buffered Badminton Landing Prediction System v5.1 - Fully Fixed Architecture"
+    )
 
     parser.add_argument("--video1", type=str, required=True,
                         help="Path to first camera video file")
     parser.add_argument("--video2", type=str, required=True,
                         help="Path to second camera video file")
-    parser.add_argument("--timestamps1", type=str, default=None,
-                        help="Path to first camera timestamps file")
-    parser.add_argument("--timestamps2", type=str, default=None,
-                        help="Path to second camera timestamps file")
     parser.add_argument("--calibrated", action="store_true",
                         help="Skip calibration if cameras are already calibrated")
     parser.add_argument("--cam1_params", type=str, default=None,
-                        help="Path to camera 1 parameters file (if calibrated)")
+                        help="Path to camera 1 parameters file")
     parser.add_argument("--cam2_params", type=str, default=None,
-                        help="Path to camera 2 parameters file (if calibrated)")
+                        help="Path to camera 2 parameters file")
 
     return parser.parse_args()
 
 
 def main():
-    """主函数"""
+    """主函数 - 增强版本"""
     try:
-        print("Badminton Shuttlecock Landing Prediction and Boundary Judgment System")
-        print(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+        print("Enhanced Buffered Badminton Shuttlecock Landing Prediction System v5.1")
+        print("Fully Fixed Architecture with Robust 3D Visualization")
+        print("=" * 80)
+        print(f"Session started at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"Current User: Liao-cyber360")
+        print(f"System Architecture: Non-blocking with Enhanced Debug Visualization")
+        print(f"Key Improvements: Window lifecycle, State management, Error recovery")
+        print("=" * 80)
 
-        # 解析命令行参数
         args = parse_arguments()
 
-        # 创建系统实例
-        system = BadmintonSystem()
+        # 验证视频文件
+        if not os.path.exists(args.video1):
+            raise FileNotFoundError(f"Video file not found: {args.video1}")
+        if not os.path.exists(args.video2):
+            raise FileNotFoundError(f"Video file not found: {args.video2}")
 
-        # 初始化系统
-        system.initialize_system(
-            args.video1, args.video2,
-            args.timestamps1, args.timestamps2
-        )
+        print(f"📹 Input Videos:")
+        print(f"   Camera 1: {args.video1}")
+        print(f"   Camera 2: {args.video2}")
 
-        # 如果已有标定参数，直接加载
+        # 创建和初始化系统
+        system = BufferedBadmintonSystem()
+        system.initialize_system(args.video1, args.video2)
+
+        # 处理标定
         if args.calibrated and args.cam1_params and args.cam2_params:
-            print("Loading existing calibration parameters...")
-            system.camera1_params_file = args.cam1_params
-            system.camera2_params_file = args.cam2_params
-            system.detector1.load_camera_params(args.cam1_params)
-            system.detector2.load_camera_params(args.cam2_params)
-            system.stereo_processor.load_camera_parameters(args.cam1_params, args.cam2_params)
-            system.calibration_done = True
+            if os.path.exists(args.cam1_params) and os.path.exists(args.cam2_params):
+                system.load_existing_calibration(args.cam1_params, args.cam2_params)
+            else:
+                print("⚠️ Warning: Calibration files not found, starting calibration...")
+                if not system.calibration_mode():
+                    raise RuntimeError("Calibration failed")
         else:
-            # 否则进入标定模式
-            print("Entering calibration mode...")
-            print("Please follow the instructions on screen to calibrate the cameras.")
-            system.calibration_mode()
+            print("🎯 Starting camera calibration process...")
+            if not system.calibration_mode():
+                raise RuntimeError("Calibration failed")
 
-        # 开始处理视频
+        print("\n" + "=" * 80)
+        print("✅ SYSTEM READY - Starting Enhanced Video Processing")
+        print("=" * 80)
+
+        # 开始主处理循环
         system.start_processing()
 
+    except KeyboardInterrupt:
+        print(f"\n{'=' * 80}")
+        print("⚠️ Program interrupted by user (Ctrl+C)")
+        print(f"Session ended at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"{'=' * 80}")
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+    except RuntimeError as e:
+        print(f"❌ Runtime Error: {e}")
     except Exception as e:
-        print(f"Error in main function: {e}")
+        print(f"❌ Unexpected error in main: {e}")
         import traceback
         traceback.print_exc()
+        print(f"\nSession ended with error at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    finally:
         cv2.destroyAllWindows()
+        print("\n✅ All resources cleaned up successfully.")
+        print("Thank you for using Enhanced Badminton Prediction System v5.1")
 
 
 if __name__ == "__main__":

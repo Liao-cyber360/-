@@ -3,879 +3,710 @@ import numpy as np
 from ultralytics import YOLO
 from collections import deque
 import time
+import threading
 from utils import config
 
 
-class LandingDetector:
-    """羽毛球落地检测器"""
+class TrajectoryQualityEvaluator:
+    """轨迹质量评估器"""
 
-    def __init__(self, threshold=5, confirmation_frames=3, height_threshold=20.0):
-        """
-        初始化落地检测器
+    def __init__(self):
+        # 评估权重
+        self.physics_weight = 0.3
+        self.continuity_weight = 0.25
+        self.completeness_weight = 0.25
+        self.temporal_weight = 0.2
 
-        参数:
-            threshold: 速度阈值，低于此值视为可能落地（像素/帧）
-            confirmation_frames: 连续多少帧低于阈值判定为落地
-            height_threshold: 高度阈值，Z坐标低于此值视为接近地面（单位：厘米）
-        """
-        self.threshold = threshold
-        self.confirmation_frames = confirmation_frames
-        self.height_threshold = height_threshold  # 高度阈值参数
-        self.previous_positions = deque(maxlen=10)  # 存储最近的位置
-        self.previous_3d_positions = deque(maxlen=10)  # 存储最近的3D位置
-        self.slow_frame_counter = 0  # 连续慢速帧计数器
-        self.last_landing_time = 0  # 上次检测到落地的时间
-        self.landing_cooldown = 15.0  # 落地检测冷却时间（秒）
+        # 物理模型参数
+        self.gravity = 9.8 * 100  # cm/s²
+        self.min_trajectory_length = 8  # 最少轨迹点数
+        self.max_speed_change = 1000  # 最大速度变化 cm/s
 
-    def detect_landing(self, position, timestamp, position_3d=None):
-        """
-        检测羽毛球是否落地
+    def evaluate_trajectory_segment(self, points_3d, timestamps, current_time):
+        """评估轨迹片段质量"""
+        if len(points_3d) < 3:
+            return 0.0
 
-        参数:
-            position: 当前球的2D位置 (x, y)
-            timestamp: 当前时间戳
-            position_3d: 当前球的3D位置 (x, y, z)，如果有的话
+        # 转换为numpy数组
+        points = np.array(points_3d)
+        times = np.array(timestamps)
 
-        返回:
-            landing_detected: 是否检测到落地
-        """
-        # 冷却时间检查（避免短时间内重复触发）
-        if timestamp - self.last_landing_time < self.landing_cooldown:
-            return False
+        # 计算各项得分
+        physics_score = self._evaluate_physics(points, times)
+        continuity_score = self._evaluate_continuity(points, times)
+        completeness_score = self._evaluate_completeness(points, times)
+        temporal_score = self._evaluate_temporal_weight(times, current_time)
 
-        # 添加当前位置
-        self.previous_positions.append((position, timestamp))
-        if position_3d is not None:
-            self.previous_3d_positions.append((position_3d, timestamp))
-
-        # 至少需要2个点才能计算速度
-        if len(self.previous_positions) < 2:
-            return False
-
-        # 计算当前2D速度
-        curr_pos, curr_time = self.previous_positions[-1]
-        prev_pos, prev_time = self.previous_positions[-2]
-
-        # 避免时间差为0
-        time_diff = max(curr_time - prev_time, 0.001)
-
-        # 计算位移和速度
-        dx = curr_pos[0] - prev_pos[0]
-        dy = curr_pos[1] - prev_pos[1]
-        displacement = np.sqrt(dx ** 2 + dy ** 2)
-        speed = displacement / time_diff  # 像素/秒
-
-        # 判断是否为低速
-        is_slow = speed < self.threshold
-
-        # 判断高度是否接近地面
-        is_near_ground = False
-        if position_3d is not None and len(position_3d) >= 3:
-            z_coord = position_3d[2]
-            is_near_ground = z_coord <= self.height_threshold
-        elif len(self.previous_3d_positions) > 0:
-            # 如果当前帧没有3D位置但之前有，使用最近的3D位置
-            latest_3d_pos = self.previous_3d_positions[-1][0]
-            if len(latest_3d_pos) >= 3:
-                z_coord = latest_3d_pos[2]
-                is_near_ground = z_coord <= self.height_threshold
-
-        # 同时满足低速和接近地面的条件时，计数器增加
-        if is_slow and (is_near_ground or position_3d is None):
-            self.slow_frame_counter += 1
-        else:
-            self.slow_frame_counter = 0
-
-        # 如果连续多帧同时满足条件，判定为落地
-        if self.slow_frame_counter >= self.confirmation_frames:
-            self.last_landing_time = timestamp
-            self.slow_frame_counter = 0
-            return True
-
-        return False
-
-    def reset(self):
-        """重置检测器状态"""
-        self.previous_positions.clear()
-        self.previous_3d_positions.clear()
-        self.slow_frame_counter = 0
-
-
-class ShuttlecockDetector:
-    """羽毛球检测与跟踪器"""
-
-    def __init__(self, model_path, camera_id=0):
-        """
-        初始化检测器
-
-        参数:
-            model_path: YOLOv8模型路径
-            camera_id: 相机编号（0或1）
-        """
-        # 加载YOLO模型
-        self.model = YOLO(model_path)
-        self.camera_id = camera_id
-
-        # 轨迹存储
-        self.max_trajectory_length = config.trajectory_buffer_size
-        self.trajectory = deque(maxlen=self.max_trajectory_length)  # 轨迹点 [(点,时间戳),...]
-        self.raw_detections = deque(maxlen=self.max_trajectory_length * 2)  # 原始检测结果 [(点列表,时间戳,帧ID),...]
-
-        # 轨迹颜色渐变 (BGR格式)
-        self.start_color = (255, 0, 0)  # 蓝色 (最旧的位置)
-        self.end_color = (0, 0, 255)  # 红色 (最新的位置)
-
-        # 落地判断
-        self.landing_detector = LandingDetector(
-            threshold=config.landing_detection_threshold,
-            confirmation_frames=config.landing_confirmation_frames,
-            height_threshold=config.landing_height_threshold
+        # 综合得分
+        total_score = (
+                physics_score * self.physics_weight +
+                continuity_score * self.continuity_weight +
+                completeness_score * self.completeness_weight +
+                temporal_score * self.temporal_weight
         )
 
-        # 球的3D位置历史记录
-        self.positions_3d = deque(maxlen=self.max_trajectory_length)
-        self.timestamps = deque(maxlen=self.max_trajectory_length)
+        return total_score
 
-        # 相机投影参数
-        self.camera_matrix = None
-        self.dist_coeffs = None
-        self.rotation_vector = None
-        self.translation_vector = None
+    def _evaluate_physics(self, points, times):
+        """评估物理合理性"""
+        if len(points) < 3:
+            return 0.0
 
-        # 移除 court_mask 成员变量
+        try:
+            # 计算速度
+            velocities = []
+            for i in range(1, len(points)):
+                dt = times[i] - times[i - 1]
+                if dt > 0:
+                    vel = (points[i] - points[i - 1]) / dt
+                    velocities.append(vel)
 
-        # 轨迹连续性判断阈值
-        self.continuity_threshold = 50  # 相邻帧的最大位移距离
-        self.frame_interval_multiplier = 1.5  # 间隔帧位移阈值的乘数
-        self.last_frame_id = -1  # 上一帧的ID
-        self.last_position = None  # 上一帧的位置
+            if len(velocities) < 2:
+                return 0.0
 
-    def load_camera_params(self, params_file):
-        """从文件加载相机参数"""
-        fs = cv2.FileStorage(params_file, cv2.FILE_STORAGE_READ)
-        self.camera_matrix = fs.getNode("camera_matrix").mat()
-        self.dist_coeffs = fs.getNode("distortion_coefficients").mat().flatten()
-        self.rotation_vector = fs.getNode("rotation_vector").mat()
-        self.translation_vector = fs.getNode("translation_vector").mat()
-        fs.release()
+            velocities = np.array(velocities)
 
-        print(f"Camera {self.camera_id} parameters loaded")
+            # 1. 检查Z方向是否有下降趋势
+            z_velocities = velocities[:, 2]
+            has_downward_trend = np.mean(z_velocities) < -50  # 平均向下速度 > 50 cm/s
 
-    def detect(self, frame, timestamp, frame_id=None):
-        """
-        在帧中检测羽毛球
+            # 2. 检查速度变化的平滑性
+            speed_changes = []
+            for i in range(1, len(velocities)):
+                speed_change = np.linalg.norm(velocities[i] - velocities[i - 1])
+                speed_changes.append(speed_change)
 
-        参数:
-            frame: 当前帧
-            timestamp: 时间戳
-            frame_id: 帧ID，如果没有提供，则使用内部计数
+            avg_speed_change = np.mean(speed_changes) if speed_changes else 0
+            smooth_score = max(0, 1 - avg_speed_change / self.max_speed_change)
 
-        返回:
-            display_frame: 可视化后的帧
-            shuttlecock_pos: 选择的羽毛球位置
-            landing_detected: 是否检测到落地
-        """
-        if frame_id is None:
-            frame_id = self.last_frame_id + 1
+            # 3. 检查轨迹形状是否接近抛物线
+            # 简化检查：Z坐标随时间的二次拟合
+            try:
+                z_coords = points[:, 2]
+                time_relative = times - times[0]
+                poly_coeffs = np.polyfit(time_relative, z_coords, 2)
+                poly_fit = np.polyval(poly_coeffs, time_relative)
+                fit_error = np.mean(np.abs(z_coords - poly_fit))
+                parabola_score = max(0, 1 - fit_error / 100)  # 误差小于10cm得满分
+            except:
+                parabola_score = 0.5
 
-        self.last_frame_id = frame_id
+            # 综合物理得分
+            physics_score = (
+                    (1.0 if has_downward_trend else 0.3) * 0.4 +
+                    smooth_score * 0.3 +
+                    parabola_score * 0.3
+            )
 
-        # 直接使用原始帧进行检测，不应用掩码
-        # 使用YOLO进行预测
-        results = self.model(frame, conf=0.3)  # 设置置信度阈值
+            return min(1.0, physics_score)
 
-        # 检测结果可视化框架
-        display_frame = frame.copy()
+        except Exception as e:
+            return 0.0
 
-        # 找到所有羽毛球
-        all_shuttlecock_pos = []
+    def _evaluate_continuity(self, points, times):
+        """评估连续性"""
+        if len(points) < 2:
+            return 0.0
+
+        # 时间间隔的一致性
+        time_intervals = np.diff(times)
+        expected_interval = 1.0 / 30.0  # 30fps
+
+        # 计算时间间隔的标准差
+        interval_std = np.std(time_intervals)
+        time_consistency = max(0, 1 - interval_std / expected_interval)
+
+        # 空间距离的合理性
+        distances = []
+        for i in range(1, len(points)):
+            dist = np.linalg.norm(points[i] - points[i - 1])
+            distances.append(dist)
+
+        avg_distance = np.mean(distances) if distances else 0
+        # 合理的帧间距离应该在1-50cm之间
+        distance_score = 1.0 if 1 <= avg_distance <= 50 else max(0, 1 - abs(avg_distance - 25) / 100)
+
+        # 综合连续性得分
+        continuity_score = (time_consistency * 0.6 + distance_score * 0.4)
+
+        return continuity_score
+
+    def _evaluate_completeness(self, points, times):
+        """评估完整性"""
+        if len(points) < self.min_trajectory_length:
+            length_score = len(points) / self.min_trajectory_length
+        else:
+            length_score = 1.0
+
+        # 检查是否包含足够的下降段
+        z_coords = points[:, 2]
+        z_range = np.max(z_coords) - np.min(z_coords)
+        height_score = min(1.0, z_range / 100)  # 1米高度差得满分
+
+        # 检查是否接近地面
+        min_height = np.min(z_coords)
+        ground_proximity = max(0, 1 - min_height / 200)  # 2米以下开始得分
+
+        # 时间跨度
+        time_span = times[-1] - times[0]
+        time_score = min(1.0, time_span / 1.0)  # 1秒时间跨度得满分
+
+        completeness_score = (
+                length_score * 0.3 +
+                height_score * 0.3 +
+                ground_proximity * 0.2 +
+                time_score * 0.2
+        )
+
+        return completeness_score
+
+    def _evaluate_temporal_weight(self, times, current_time):
+        """评估时间权重（越近的轨迹权重越高）"""
+        if len(times) == 0:
+            return 0.0
+
+        latest_time = times[-1]
+        time_diff = current_time - latest_time
+
+        # 指数衰减，2秒内保持高权重
+        temporal_score = np.exp(-time_diff / 2.0)
+
+        return temporal_score
+
+
+class TrajectorySegmentManager:
+    """轨迹片段管理器"""
+
+    def __init__(self):
+        self.quality_evaluator = TrajectoryQualityEvaluator()
+        self.min_segment_length = 5
+        self.segment_overlap = 0.3  # 片段重叠30%
+
+    def find_best_trajectory_segment(self, points_3d, timestamps, current_time):
+        """找到最佳轨迹片段"""
+        if len(points_3d) < self.min_segment_length:
+            return None, None, 0.0
+
+        best_segment = None
+        best_timestamps = None
+        best_score = 0.0
+
+        # 滑动窗口评估不同片段
+        segment_length = max(self.min_segment_length, len(points_3d) // 3)
+        step_size = max(1, int(segment_length * (1 - self.segment_overlap)))
+
+        for start_idx in range(0, len(points_3d) - self.min_segment_length + 1, step_size):
+            end_idx = min(start_idx + segment_length, len(points_3d))
+
+            segment_points = points_3d[start_idx:end_idx]
+            segment_times = timestamps[start_idx:end_idx]
+
+            score = self.quality_evaluator.evaluate_trajectory_segment(
+                segment_points, segment_times, current_time
+            )
+
+            if score > best_score:
+                best_score = score
+                best_segment = segment_points
+                best_timestamps = segment_times
+
+        return best_segment, best_timestamps, best_score
+
+
+class BufferedImageProcessor:
+    """缓冲图像处理器"""
+
+    def __init__(self, model_path, buffer_duration=5.0, fps=30):
+        self.model = YOLO(model_path)
+        self.buffer_duration = buffer_duration
+        self.fps = fps
+        self.max_buffer_size = int(buffer_duration * fps)
+
+        # 图像缓冲区
+        self.image_buffer1 = deque(maxlen=self.max_buffer_size)
+        self.image_buffer2 = deque(maxlen=self.max_buffer_size)
+        self.timestamp_buffer = deque(maxlen=self.max_buffer_size)
+        # Enhanced state management
+        self.processing_lock = threading.Lock()  # Add thread safety
+        self.last_processing_time = 0
+        self.min_processing_interval = 2.0  # Minimum 2 seconds between processing
+
+        # 处理状态
+        self.is_processing = False
+        self.processing_thread = None
+        self.processing_callback = None
+
+        print(f"BufferedImageProcessor initialized with {buffer_duration}s buffer")
+
+    def add_frame_pair(self, frame1, frame2, timestamp):
+        """添加帧对到缓冲区"""
+        if not self.is_processing:  # 只在非处理状态下缓冲
+            self.image_buffer1.append(frame1.copy() if frame1 is not None else None)
+            self.image_buffer2.append(frame2.copy() if frame2 is not None else None)
+            self.timestamp_buffer.append(timestamp)
+
+    def trigger_processing(self, callback=None):
+        """Thread-safe processing trigger with cooldown"""
+        current_time = time.time()
+
+        with self.processing_lock:
+            if self.is_processing:
+                print("⚠️ Processing already in progress...")
+                return False
+
+            # Check cooldown period
+            if current_time - self.last_processing_time < self.min_processing_interval:
+                remaining = self.min_processing_interval - (current_time - self.last_processing_time)
+                print(f"⏱️ Processing cooldown: {remaining:.1f}s remaining")
+                return False
+
+            if len(self.image_buffer1) < 10:
+                print("❌ Insufficient buffered frames for processing")
+                return False
+
+            self.processing_callback = callback
+            self.is_processing = True
+            self.last_processing_time = current_time
+
+        # Start processing thread
+        self.processing_thread = threading.Thread(target=self._process_buffered_frames)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+
+        return True
+
+
+
+    def _process_buffered_frames(self):
+        """处理缓冲的帧"""
+        try:
+            print(f"Processing {len(self.image_buffer1)} buffered frames...")
+
+            # 复制缓冲区数据以避免处理期间的修改
+            frames1 = list(self.image_buffer1)
+            frames2 = list(self.image_buffer2)
+            timestamps = list(self.timestamp_buffer)
+
+            # 批量YOLO检测
+            all_detections1 = []
+            all_detections2 = []
+
+            # 处理相机1
+            for frame in frames1:
+                if frame is not None:
+                    detections = self._detect_shuttlecock_in_frame(frame)
+                else:
+                    detections = []
+                all_detections1.append(detections)
+
+            # 处理相机2
+            for frame in frames2:
+                if frame is not None:
+                    detections = self._detect_shuttlecock_in_frame(frame)
+                else:
+                    detections = []
+                all_detections2.append(detections)
+
+            # 回调处理结果
+            if self.processing_callback:
+                self.processing_callback(
+                    all_detections1, all_detections2, timestamps,
+                    frames1, frames2
+                )
+
+        except Exception as e:
+            print(f"❌ Error in processing buffered frames: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Ensure state is always reset
+            with self.processing_lock:
+                self.is_processing = False
+            print("✅ Buffered frame processing completed")
+
+    def force_reset_processing_state(self):
+        """Force reset processing state (for emergency cleanup)"""
+        with self.processing_lock:
+            self.is_processing = False
+            self.processing_callback = None
+            if self.processing_thread and self.processing_thread.is_alive():
+                # Don't join, just mark as completed
+                pass
+        print("🔄 Processing state force reset")
+
+    def clear_buffer(self):
+        """Enhanced buffer clearing with state reset"""
+        with self.processing_lock:
+            if not self.is_processing:
+                self.image_buffer1.clear()
+                self.image_buffer2.clear()
+                self.timestamp_buffer.clear()
+                print("✅ Image buffer cleared")
+            else:
+                print("⚠️ Cannot clear buffer while processing")
+
+    def _detect_shuttlecock_in_frame(self, frame):
+        """在单帧中检测羽毛球"""
+        if frame is None:
+            return []
+
+        results = self.model(frame, conf=0.3, verbose=False)
+        detections = []
 
         for r in results:
-            # 检查是否有关键点结果
+            # 处理关键点结果
             if hasattr(r, 'keypoints') and r.keypoints is not None:
                 kpts = r.keypoints.xy.cpu().numpy() if hasattr(r.keypoints.xy, "cpu") else r.keypoints.xy
                 for kp_list in kpts:
                     for kp in kp_list:
-                        if not np.isnan(kp).any():  # 排除无效点
-                            all_shuttlecock_pos.append((int(kp[0]), int(kp[1])))
+                        if not np.isnan(kp).any():
+                            pos = (int(kp[0]), int(kp[1]))
+                            detections.append((pos, 1.0))
 
-            # 如果没有关键点结果，使用边界框
-            if len(r.boxes) > 0:
+            # 处理边界框结果
+            if hasattr(r, 'boxes') and len(r.boxes) > 0:
                 boxes = r.boxes.xyxy.cpu().numpy() if hasattr(r.boxes.xyxy, "cpu") else r.boxes.xyxy
                 classes = r.boxes.cls.cpu().numpy() if hasattr(r.boxes.cls, "cpu") else r.boxes.cls
+                confidences = r.boxes.conf.cpu().numpy() if hasattr(r.boxes.conf, "cpu") else r.boxes.conf
 
-                # 假设羽毛球类别ID是0
                 shuttlecock_indices = np.where(classes == 0)[0]
-
                 for idx in shuttlecock_indices:
                     box = boxes[idx]
+                    conf = confidences[idx]
                     x1, y1, x2, y2 = map(int, box)
-
-                    # 计算球头中心点
-                    all_shuttlecock_pos.append(((x1 + x2) // 2, (y1 + y2) // 2))
-
-        # 保存所有检测结果
-        self.raw_detections.append((all_shuttlecock_pos, timestamp, frame_id))
-
-        # 选择最可能的羽毛球位置（基于轨迹的连续性）
-        shuttlecock_pos = self._select_best_shuttlecock(all_shuttlecock_pos)
-
-        # 如果检测到羽毛球，添加到轨迹并检查是否落地
-        landing_detected = False
-        position_3d = None
-        if shuttlecock_pos is not None:
-            self.trajectory.append((shuttlecock_pos, timestamp, frame_id))
-            self.last_position = shuttlecock_pos
-
-            # 如果已有相机参数，进行3D位置估计
-            if hasattr(self, 'camera_matrix') and hasattr(self, 'rotation_vector'):
-                position_3d = self.estimate_3d_position(shuttlecock_pos)
-                if position_3d is not None:
-                    self.positions_3d.append((position_3d, timestamp))
-
-            # 进行落地检测，传入3D位置信息
-            landing_detected = self.landing_detector.detect_landing(shuttlecock_pos, timestamp, position_3d)
-
-            # 在当前位置绘制一个圆圈
-            cv2.circle(display_frame, shuttlecock_pos, 5, (0, 255, 0), -1)
-
-        # 绘制所有检测到的羽毛球（不同颜色标识）
-        for pos in all_shuttlecock_pos:
-            if pos == shuttlecock_pos:
-                continue  # 跳过已经绘制的主要羽毛球
-            cv2.circle(display_frame, pos, 5, (0, 165, 255), 1)  # 浅橙色，非填充
-
-        # 绘制轨迹
-        self.draw_trajectory(display_frame)
-
-        return display_frame, shuttlecock_pos, landing_detected
-    def _select_best_shuttlecock(self, detected_positions):
-        """
-        从多个检测结果中选择最佳的羽毛球位置
-
-        参数:
-            detected_positions: 当前帧检测到的所有羽毛球位置
-
-        返回:
-            best_position: 最佳的羽毛球位置
-        """
-        if not detected_positions:
-            return None
-
-        # 如果只有一个检测结果，直接返回
-        if len(detected_positions) == 1:
-            return detected_positions[0]
-
-        # 如果没有历史轨迹，返回第一个检测结果
-        if not self.trajectory:
-            return detected_positions[0]
-
-        # 获取上一个轨迹点
-        last_pos = self.last_position
-
-        if last_pos is None:
-            return detected_positions[0]
-
-        # 计算每个检测结果与上一个点的距离
-        distances = [np.linalg.norm(np.array(pos) - np.array(last_pos)) for pos in detected_positions]
-
-        # 找到距离最近的点
-        min_dist_idx = np.argmin(distances)
-        min_dist = distances[min_dist_idx]
-
-        # 检查最小距离是否小于阈值
-        if min_dist <= self.continuity_threshold:
-            return detected_positions[min_dist_idx]
-
-        # 如果所有点都超过阈值，返回距离最近的点
-        return detected_positions[min_dist_idx]
-
-    def estimate_3d_position(self, point_2d):
-        """使用投影矩阵估计3D位置（射线法）"""
-        if point_2d is None or not hasattr(self, 'camera_matrix') or not hasattr(self, 'rotation_vector'):
-            return None
-
-        # 将点从图像坐标转换为归一化相机坐标
-        point_2d = np.array([[point_2d[0], point_2d[1]]], dtype=np.float32)
-        point_2d_undistorted = cv2.undistortPoints(point_2d, self.camera_matrix, self.dist_coeffs)
-
-        # 构建射线向量
-        ray_dir = np.array([point_2d_undistorted[0][0][0],
-                            point_2d_undistorted[0][0][1],
-                            1.0], dtype=np.float32)
-
-        # 将射线方向从相机坐标系转换到世界坐标系
-        rotation_matrix, _ = cv2.Rodrigues(self.rotation_vector)
-        ray_dir_world = np.dot(rotation_matrix.T, ray_dir)
-        ray_dir_world = ray_dir_world / np.linalg.norm(ray_dir_world)  # 单位化
-
-        # 相机中心在世界坐标系中的位置
-        camera_center_world = -np.dot(rotation_matrix.T, self.translation_vector)
-
-        # 假设z=0平面（场地平面）
-        # 计算射线与z=0平面的交点
-        if abs(ray_dir_world[2]) > 1e-10:  # 避免除以零
-            t = -camera_center_world[2] / ray_dir_world[2]
-            if t > 0:  # 确保交点在相机前方
-                intersection = camera_center_world + t * ray_dir_world
-                return (intersection[0][0], intersection[1][0], 0.0)
-
-        return None
-
-    def draw_trajectory(self, frame):
-        """在帧上绘制羽毛球轨迹"""
-        if len(self.trajectory) > 1:
-            points = [t[0] for t in self.trajectory]  # 提取点坐标
-
-            for i in range(len(points) - 1):
-                # 计算颜色插值 (老的点是蓝色，新的点是红色)
-                alpha = i / (len(points) - 1)
-                b = int(self.start_color[0] * (1 - alpha) + self.end_color[0] * alpha)
-                g = int(self.start_color[1] * (1 - alpha) + self.end_color[1] * alpha)
-                r = int(self.start_color[2] * (1 - alpha) + self.end_color[2] * alpha)
-
-                # 点的大小也随时间变化 (老的点小，新的点大)
-                radius = max(3, int(3 + (i * 7 / len(points))))
-
-                # 绘制点
-                point = points[i]
-                cv2.circle(frame, point, radius, (b, g, r), -1)
-
-                # 连接相邻点
-               # next_point = points[i + 1]
-                #cv2.line(frame, point, next_point, (b, g, r), max(1, radius // 3))
-
-    def reset_trajectory(self):
-        """重置轨迹数据"""
-        self.trajectory.clear()
-        self.raw_detections.clear()
-        self.positions_3d.clear()
-        self.timestamps.clear()
-        self.landing_detector.reset()
-        self.last_frame_id = -1
-        self.last_position = None
-
-    def get_recent_trajectory(self, time_window=0.5):
-        """获取指定时间窗口内的轨迹点"""
-        if not self.trajectory:
-            return [], []
-
-        recent_points = []
-        recent_timestamps = []
-        current_time = self.trajectory[-1][1] if self.trajectory else 0
-
-        for point, timestamp, _ in self.trajectory:
-            if current_time - timestamp <= time_window:
-                recent_points.append(point)
-                recent_timestamps.append(timestamp)
-
-        return recent_points, recent_timestamps
-
-    def get_recent_3d_positions(self, time_window=0.5):
-        """获取指定时间窗口内的3D位置点"""
-        if not self.positions_3d:
-            return [], []
-
-        recent_points = []
-        recent_timestamps = []
-        current_time = self.positions_3d[-1][1] if self.positions_3d else 0
-
-        for position, timestamp in self.positions_3d:
-            if current_time - timestamp <= time_window:
-                recent_points.append(position)
-                recent_timestamps.append(timestamp)
-
-        return recent_points, recent_timestamps
-
-    def filter_target_court_trajectory(self, stereo_processor):
-        """
-        筛选出目标场地上方的轨迹点
-     按帧吗,,其实应该时间戳,,,
-        参数:
-            stereo_processor: 双目处理器实例，用于三维重建
-
-        返回:
-            filtered_trajectory: 筛选后的轨迹点列表 [(点,时间戳),...]
-        """
-        if not self.raw_detections or not hasattr(stereo_processor, 'camera1_params'):
-            return []
-
-        # 获取所有历史检测结果
-        frame_results = {}  # {帧ID: (点列表, 时间戳), ...}
-        for points, timestamp, frame_id in self.raw_detections:
-            frame_results[frame_id] = (points, timestamp)
-
-        # 逐帧处理，构建连续轨迹
-        continuous_trajectory = []
-        current_point = None
-
-        # 按帧ID排序
-        sorted_frame_ids = sorted(frame_results.keys())
-
-        # 第一次遍历：筛选出目标场地上方的点
-        for frame_id in sorted_frame_ids:
-            points, timestamp = frame_results[frame_id]
-
-            # 如果当前帧没有检测点，继续下一帧
-            if not points:
-                continue
-
-            # 如果是第一帧或者当前没有参考点，先用第一个点
-            if current_point is None:
-                current_point = points[0]
-                continuous_trajectory.append((current_point, timestamp, frame_id))
-                continue
-
-            # 计算当前帧中每个点与上一个点的距离
-            min_dist = float('inf')
-            best_point = None
-
-            for point in points:
-                dist = np.linalg.norm(np.array(point) - np.array(current_point))
-                if dist < min_dist:
-                    min_dist = dist
-                    best_point = point
-
-            # 检查最小距离是否在阈值范围内
-            frame_gap = frame_id - continuous_trajectory[-1][2]  # 与上一个点的帧间隔
-            threshold = self.continuity_threshold * (1 + (frame_gap - 1) * self.frame_interval_multiplier)
-
-            if min_dist <= threshold:
-                current_point = best_point
-                continuous_trajectory.append((current_point, timestamp, frame_id))
-
-        return continuous_trajectory
-
-    def identify_natural_falling_segment(self, trajectory, timestamps=None, frame_ids=None):
-        """
-        识别自然下落段轨迹
-
-        参数:
-            trajectory: 轨迹点列表 [(x,y), ...] 或 [(x,y,时间戳,帧ID), ...]
-            timestamps: 时间戳列表 (如果trajectory中没有包含)
-            frame_ids: 帧ID列表 (如果trajectory中没有包含)
-
-        返回:
-            natural_segment: 自然下落段轨迹点列表
-            natural_timestamps: 对应的时间戳列表
-        """
-        # 检查输入格式
-        if not trajectory:
-            return [], []
-
-        # 处理输入格式
-        points = []
-        ts = []
-        fids = []
-
-        if len(trajectory[0]) == 2:  # 只包含坐标
-            points = trajectory
-            ts = timestamps if timestamps else [0] * len(trajectory)
-            fids = frame_ids if frame_ids else list(range(len(trajectory)))
-        elif len(trajectory[0]) == 3:  # 包含坐标和时间戳
-            points = [t[0] for t in trajectory]
-            ts = [t[1] for t in trajectory]
-            fids = frame_ids if frame_ids else list(range(len(trajectory)))
-        elif len(trajectory[0]) == 4 or len(trajectory[0]) == 3:  # 包含坐标、时间戳和帧ID
-            points = [t[0] for t in trajectory]
-            ts = [t[1] for t in trajectory]
-            fids = [t[2] for t in trajectory]
-
-        if len(points) < 5:
-            return trajectory, ts
-
-        # 计算相邻点之间的速度和加速度
-        velocities = []
-        accelerations = []
-        directions = []
-
-        for i in range(1, len(points)):
-            # 计算位移
-            dx = points[i][0] - points[i - 1][0]
-            dy = points[i][1] - points[i - 1][1]
-
-            # 计算时间差
-            dt = max(ts[i] - ts[i - 1], 0.001)
-
-            # 计算速度向量和大小
-            velocity_vector = np.array([dx / dt, dy / dt])
-            velocity_magnitude = np.linalg.norm(velocity_vector)
-            velocities.append(velocity_magnitude)
-
-            # 保存归一化的方向向量
-            if velocity_magnitude > 1e-6:
-                directions.append(velocity_vector / velocity_magnitude)
-            else:
-                directions.append(np.array([0, 0]))
-
-        # 计算加速度和方向变化
-        for i in range(1, len(velocities)):
-            # 计算速度变化
-            dv = velocities[i] - velocities[i - 1]
-            dt = max(ts[i + 1] - ts[i], 0.001)
-            acceleration = dv / dt
-            accelerations.append(acceleration)
-
-        # 计算方向变化
-        direction_changes = []
-        for i in range(1, len(directions)):
-            # 计算方向变化的角度
-            dot_product = np.clip(np.dot(directions[i], directions[i - 1]), -1.0, 1.0)
-            angle_rad = np.arccos(dot_product)
-            angle_deg = np.degrees(angle_rad)
-            direction_changes.append(angle_deg)
-
-        # 标记外力影响点
-        external_force_points = []
-        acceleration_threshold = np.std(accelerations) * 2 if accelerations else 0  # 加速度阈值
-        direction_threshold = 50.0  # 方向变化阈值
-
-        for i in range(len(direction_changes)):
-            # i+1 是速度的索引，i+2 是点的索引
-            if i + 2 >= len(points):
-                break
-
-            # 检查是否有突然的加速度和明显的方向变化
-            if (abs(accelerations[i]) > acceleration_threshold and
-                    direction_changes[i] > direction_threshold):
-                external_force_points.append(i + 2)
-
-        # 寻找最长的自然下落段（未受外力影响的段）
-        segments = []
-        current_segment = []
-
-        for i in range(len(points)):
-            if i in external_force_points:
-                if current_segment:
-                    segments.append(current_segment)
-                    current_segment = []
-            current_segment.append(i)
-
-        if current_segment:
-            segments.append(current_segment)
-
-        # 找出最长的段
-        longest_segment = max(segments, key=len) if segments else list(range(len(points)))
-
-        # 提取自然下落段
-        natural_indices = longest_segment
-        natural_segment = [points[i] for i in natural_indices]
-        natural_timestamps = [ts[i] for i in natural_indices]
-
-        return natural_segment, natural_timestamps
+                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    detections.append((center, conf))
+
+        return detections
+
+    def get_buffer_info(self):
+        """获取缓冲区信息"""
+        return {
+            'buffer_size': len(self.image_buffer1),
+            'max_size': self.max_buffer_size,
+            'is_processing': self.is_processing,
+            'buffer_time_span': len(self.timestamp_buffer) / self.fps if self.timestamp_buffer else 0
+        }
+
+    def clear_buffer(self):
+        """清空缓冲区"""
+        if not self.is_processing:
+            self.image_buffer1.clear()
+            self.image_buffer2.clear()
+            self.timestamp_buffer.clear()
+            print("Image buffer cleared")
 
 
 class StereoProcessor:
-    """双目视觉处理器"""
+    """增强的双目视觉处理器 - 添加调试数据追踪"""
 
     def __init__(self):
-        """初始化双目处理器"""
-        # 相机参数
         self.camera1_params = None
         self.camera2_params = None
+        self.fundamental_matrix = None
 
-        # 3D点历史
-        self.points_3d = []
-        self.timestamps = []
+        # 轨迹管理
+        self.trajectory_manager = TrajectorySegmentManager()
+
+        # 场地过滤参数 (cm) - 扩大范围支持场地外预测
+        self.court_bounds = {
+            'x_min': -500,  # 扩大到场地外1.5米
+            'x_max': 500,
+            'y_min': -900,  # 扩大到场地外2米
+            'y_max': 900,
+            'z_min': 0,
+            'z_max': 800  # 8米高度上限
+        }
+
+        # 3D点存储
+        self.all_3d_points = []
+        self.all_timestamps = []
+
+        # 新增：调试数据存储
+        self.rejected_points = []  # 被边界过滤排除的点
+        self.low_quality_points = []  # 质量评估低的点
+        self.triangulation_failed_points = []  # 三角测量失败的点对
+
+        print("StereoProcessor initialized with debug tracking enabled")
 
     def load_camera_parameters(self, camera1_file, camera2_file):
-        """加载两个相机的参数"""
-        # 加载相机1参数
-        self.camera1_params = self._load_camera_params(camera1_file)
+        """加载相机参数"""
+        try:
+            self.camera1_params = self._load_camera_params(camera1_file)
+            self.camera2_params = self._load_camera_params(camera2_file)
+            self._compute_fundamental_matrix()
+            print("Stereo camera parameters loaded successfully")
+            return True
+        except Exception as e:
+            print(f"Error loading stereo parameters: {e}")
+            return False
 
-        # 加载相机2参数
-        self.camera2_params = self._load_camera_params(camera2_file)
-
-        print("Stereo camera parameters loaded successfully")
-
-    def load_camera_params(self, params_file):
+    def _load_camera_params(self, params_file):
         """从文件加载相机参数"""
         fs = cv2.FileStorage(params_file, cv2.FILE_STORAGE_READ)
-        self.camera_matrix = fs.getNode("camera_matrix").mat()
-        self.dist_coeffs = fs.getNode("distortion_coefficients").mat().flatten()
-        self.rotation_vector = fs.getNode("rotation_vector").mat()
-        self.translation_vector = fs.getNode("translation_vector").mat()
+
+        camera_matrix = fs.getNode("camera_matrix").mat()
+        dist_coeffs = fs.getNode("distortion_coefficients").mat().flatten()
+        rotation_vector = fs.getNode("rotation_vector").mat()
+        translation_vector = fs.getNode("translation_vector").mat()
+
         fs.release()
 
-        print(f"Camera {self.camera_id} parameters loaded")
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        camera_position = -np.dot(rotation_matrix.T, translation_vector)
 
-        # 移除可能的掩码加载代码
+        return {
+            'camera_matrix': camera_matrix,
+            'dist_coeffs': dist_coeffs,
+            'rotation_vector': rotation_vector,
+            'translation_vector': translation_vector,
+            'rotation_matrix': rotation_matrix,
+            'camera_position': camera_position
+        }
 
-    def triangulate_point(self, point1, point2):
-        """
-        通过两个相机视图中的点进行三角测量
-
-        参数:
-            point1: 相机1中的点 (x, y)
-            point2: 相机2中的点 (x, y)
-
-        返回:
-            point_3d: 三维点 (x, y, z)
-        """
+    def _compute_fundamental_matrix(self):
+        """计算基础矩阵"""
         if self.camera1_params is None or self.camera2_params is None:
-            print("Camera parameters not loaded")
+            return
+
+        try:
+            R1 = self.camera1_params['rotation_matrix']
+            R2 = self.camera2_params['rotation_matrix']
+            t1 = self.camera1_params['translation_vector']
+            t2 = self.camera2_params['translation_vector']
+
+            R_rel = R2 @ R1.T
+            t_rel = t2 - R_rel @ t1
+
+            tx = np.array([[0, -t_rel[2, 0], t_rel[1, 0]],
+                           [t_rel[2, 0], 0, -t_rel[0, 0]],
+                           [-t_rel[1, 0], t_rel[0, 0], 0]])
+
+            E = tx @ R_rel
+            K1 = self.camera1_params['camera_matrix']
+            K2 = self.camera2_params['camera_matrix']
+            self.fundamental_matrix = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+
+            print("Fundamental matrix computed successfully")
+
+        except Exception as e:
+            print(f"Error computing fundamental matrix: {e}")
+            self.fundamental_matrix = None
+
+    def process_batch_detections(self, detections_list1, detections_list2, timestamps):
+        """批量处理检测结果 - 增强调试追踪"""
+        if len(detections_list1) != len(detections_list2) != len(timestamps):
+            print("Error: Detection lists and timestamps length mismatch")
+            return []
+
+        all_3d_points = []
+        all_timestamps_3d = []
+
+        # 清空调试数据
+        self.rejected_points = []
+        self.low_quality_points = []
+        self.triangulation_failed_points = []
+
+        print(f"Processing {len(detections_list1)} frame pairs...")
+
+        for i, (det1, det2, timestamp) in enumerate(zip(detections_list1, detections_list2, timestamps)):
+            # 双目匹配
+            matched_pairs = self._match_stereo_points(det1, det2)
+
+            # 三角测量
+            for left_point, right_point, match_distance, match_conf in matched_pairs:
+                point_3d = self._triangulate_point(left_point, right_point)
+
+                if point_3d is None:
+                    # 记录三角测量失败的点对
+                    self.triangulation_failed_points.append({
+                        'left_point': left_point,
+                        'right_point': right_point,
+                        'timestamp': timestamp,
+                        'frame_index': i,
+                        'reason': 'triangulation_failed'
+                    })
+                    continue
+
+                if self._is_point_in_bounds(point_3d):
+                    all_3d_points.append(point_3d)
+                    all_timestamps_3d.append(timestamp)
+                else:
+                    # 记录被边界过滤排除的点
+                    self.rejected_points.append({
+                        'point_3d': point_3d,
+                        'timestamp': timestamp,
+                        'frame_index': i,
+                        'reason': 'out_of_bounds',
+                        'match_confidence': match_conf,
+                        'match_distance': match_distance
+                    })
+
+        # 存储所有3D点
+        self.all_3d_points = all_3d_points
+        self.all_timestamps = all_timestamps_3d
+
+        print(f"Generated {len(all_3d_points)} valid 3D points from batch processing")
+        print(f"Rejected {len(self.rejected_points)} out-of-bounds points")
+        print(f"Failed triangulation for {len(self.triangulation_failed_points)} point pairs")
+
+        return all_3d_points, all_timestamps_3d
+
+    def _match_stereo_points(self, detections_left, detections_right, epipolar_threshold=35.0):
+        """基于极线约束匹配双目点"""
+        if not detections_left or not detections_right or self.fundamental_matrix is None:
+            return []
+
+        matches = []
+
+        for left_point, left_conf in detections_left:
+            point_homo = np.array([left_point[0], left_point[1], 1])
+            epipolar_line = self.fundamental_matrix @ point_homo
+
+            best_match = None
+            min_distance = float('inf')
+            best_conf = 0
+
+            for right_point, right_conf in detections_right:
+                distance = abs(epipolar_line[0] * right_point[0] +
+                               epipolar_line[1] * right_point[1] +
+                               epipolar_line[2]) / np.sqrt(epipolar_line[0] ** 2 + epipolar_line[1] ** 2)
+
+                if distance < epipolar_threshold and distance < min_distance:
+                    min_distance = distance
+                    best_match = right_point
+                    best_conf = (left_conf + right_conf) / 2
+
+            if best_match is not None:
+                matches.append((left_point, best_match, min_distance, best_conf))
+
+        return matches
+
+    def _triangulate_point(self, point1, point2):
+        """三角测量计算3D点"""
+        if self.camera1_params is None or self.camera2_params is None:
             return None
 
-        # 将像素坐标转换为归一化相机坐标
-        point1_normalized = cv2.undistortPoints(
-            np.array([point1], dtype=np.float32),
-            self.camera1_params['camera_matrix'],
-            self.camera1_params['dist_coeffs']
-        )
+        try:
+            point1_normalized = cv2.undistortPoints(
+                np.array([point1], dtype=np.float32),
+                self.camera1_params['camera_matrix'],
+                self.camera1_params['dist_coeffs']
+            )
 
-        point2_normalized = cv2.undistortPoints(
-            np.array([point2], dtype=np.float32),
-            self.camera2_params['camera_matrix'],
-            self.camera2_params['dist_coeffs']
-        )
+            point2_normalized = cv2.undistortPoints(
+                np.array([point2], dtype=np.float32),
+                self.camera2_params['camera_matrix'],
+                self.camera2_params['dist_coeffs']
+            )
 
-        # 从归一化坐标创建射线向量
-        ray1_dir = np.array([
-            point1_normalized[0][0][0],
-            point1_normalized[0][0][1],
-            1.0
-        ])
+            ray1_dir = np.array([
+                point1_normalized[0][0][0],
+                point1_normalized[0][0][1],
+                1.0
+            ])
 
-        ray2_dir = np.array([
-            point2_normalized[0][0][0],
-            point2_normalized[0][0][1],
-            1.0
-        ])
+            ray2_dir = np.array([
+                point2_normalized[0][0][0],
+                point2_normalized[0][0][1],
+                1.0
+            ])
 
-        # 将射线方向转换到世界坐标系
-        rotation_matrix1, _ = cv2.Rodrigues(self.camera1_params['rotation_vector'])
-        rotation_matrix2, _ = cv2.Rodrigues(self.camera2_params['rotation_vector'])
+            ray1_dir_world = self.camera1_params['rotation_matrix'].T @ ray1_dir
+            ray2_dir_world = self.camera2_params['rotation_matrix'].T @ ray2_dir
 
-        ray1_dir_world = np.dot(rotation_matrix1.T, ray1_dir)
-        ray2_dir_world = np.dot(rotation_matrix2.T, ray2_dir)
+            ray1_dir_world = ray1_dir_world / np.linalg.norm(ray1_dir_world)
+            ray2_dir_world = ray2_dir_world / np.linalg.norm(ray2_dir_world)
 
-        # 标准化方向向量
-        ray1_dir_world = ray1_dir_world / np.linalg.norm(ray1_dir_world)
-        ray2_dir_world = ray2_dir_world / np.linalg.norm(ray2_dir_world)
+            camera1_position = self.camera1_params['camera_position']
+            camera2_position = self.camera2_params['camera_position']
 
-        # 相机在世界坐标系中的位置
-        camera1_position = self.camera1_params['camera_position']
-        camera2_position = self.camera2_params['camera_position']
+            n = np.cross(ray1_dir_world.flatten(), ray2_dir_world.flatten())
 
-        # 找到两条射线之间的最短连线中点
-        # 射线之间的法向量
-        n = np.cross(ray1_dir_world.flatten(), ray2_dir_world.flatten())
+            if np.linalg.norm(n) < 1e-10:
+                return None
 
-        # 如果射线平行，无法三角化
-        if np.linalg.norm(n) < 1e-10:
-            print("Warning: Rays are parallel, triangulation may be unstable")
+            n1 = np.cross(ray1_dir_world.flatten(), n)
+            n2 = np.cross(ray2_dir_world.flatten(), n)
+
+            c1 = camera1_position.flatten()
+            c2 = camera2_position.flatten()
+
+            t1 = np.dot((c2 - c1), n2) / np.dot(ray1_dir_world.flatten(), n2)
+            t2 = np.dot((c1 - c2), n1) / np.dot(ray2_dir_world.flatten(), n1)
+
+            p1 = c1 + t1 * ray1_dir_world.flatten()
+            p2 = c2 + t2 * ray2_dir_world.flatten()
+
+            point_3d = (p1 + p2) / 2
+
+            return point_3d
+
+        except Exception as e:
             return None
 
-        # 计算参数方程
-        n1 = np.cross(ray1_dir_world.flatten(), n)
-        n2 = np.cross(ray2_dir_world.flatten(), n)
-
-        # 计算两条射线上的最近点参数
-        c1 = camera1_position.flatten()
-        c2 = camera2_position.flatten()
-
-        t1 = np.dot((c2 - c1), n2) / np.dot(ray1_dir_world.flatten(), n2)
-        t2 = np.dot((c1 - c2), n1) / np.dot(ray2_dir_world.flatten(), n1)
-
-        # 计算射线上的点
-        p1 = c1 + t1 * ray1_dir_world.flatten()
-        p2 = c2 + t2 * ray2_dir_world.flatten()
-
-        # 取中点作为三维点的估计
-        point_3d = (p1 + p2) / 2
-
-        return point_3d
-
-    def process_stereo_points(self, point1, point2, timestamp):
-        """
-        处理双目视觉点，计算3D坐标
-
-        参数:
-            point1: 相机1中的点 (x, y)
-            point2: 相机2中的点 (x, y)
-            timestamp: 时间戳
-
-        返回:
-            point_3d: 三维点 (x, y, z)
-        """
-        if point1 is None or point2 is None:
-            return None
-
-        # 三角测量
-        point_3d = self.triangulate_point(point1, point2)
-
-        if point_3d is not None:
-            # 存储3D点历史
-            self.points_3d.append(point_3d)
-            self.timestamps.append(timestamp)
-
-        return point_3d
-
-    def reconstruct_3d_trajectory(self, trajectory1, timestamps1, trajectory2, timestamps2):
-        """
-        重建两个相机中的轨迹，返回3D轨迹
-
-        参数:
-            trajectory1: 相机1中的轨迹点列表
-            timestamps1: 相机1中的时间戳列表
-            trajectory2: 相机2中的轨迹点列表
-            timestamps2: 相机2中的时间戳列表
-
-        返回:
-            trajectory_3d: 3D轨迹点列表
-            trajectory_timestamps: 对应的时间戳列表
-        """
-        # 检查轨迹长度
-        if len(trajectory1) < 3 or len(trajectory2) < 3:
-            print(f"Trajectories too short for reconstruction: camera1={len(trajectory1)}, camera2={len(trajectory2)}")
-            return [], []
-
-        # 找到两个相机中时间戳的交集
-        trajectory_3d = []
-        trajectory_timestamps = []
-
-        for i, ts1 in enumerate(timestamps1):
-            # 查找最近的时间戳
-            closest_ts2_idx = None
-            min_diff = 0.02  # 20ms阈值
-
-            for j, ts2 in enumerate(timestamps2):
-                diff = abs(ts1 - ts2)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_ts2_idx = j
-
-            if closest_ts2_idx is not None:
-                # 确保索引在有效范围内
-                if i < len(trajectory1) and closest_ts2_idx < len(trajectory2):
-                    # 三角测量
-                    point_3d = self.triangulate_point(trajectory1[i], trajectory2[closest_ts2_idx])
-
-                    if point_3d is not None:
-                        # 额外的检查，确保点有意义
-                        if not np.isnan(point_3d).any() and np.all(np.abs(point_3d) < 1000):  # 排除异常大的值
-                            trajectory_3d.append(point_3d)
-                            trajectory_timestamps.append(ts1)
-
-        # 按时间戳排序
-        if trajectory_3d:
-            sorted_pairs = sorted(zip(trajectory_timestamps, trajectory_3d), key=lambda x: x[0])
-            trajectory_timestamps, trajectory_3d = zip(*sorted_pairs)
-            trajectory_timestamps = list(trajectory_timestamps)
-            trajectory_3d = list(trajectory_3d)
-
-        return trajectory_3d, trajectory_timestamps
-
-    def is_point_above_court(self, point_3d, z_threshold=0.0, court_boundary=None):
-        """
-        判断3D点是否在球场上方
-
-        参数:
-            point_3d: 3D点坐标 (x, y, z)
-            z_threshold: z坐标阈值，高于此值视为在场地上方
-            court_boundary: 场地边界 [x_min, y_min, x_max, y_max]，如果为None则使用默认值
-
-        返回:
-            is_above: 是否在场地上方
-        """
-        if point_3d is None:
+    def _is_point_in_bounds(self, point_3d):
+        """检查3D点是否在扩展边界内"""
+        if point_3d is None or len(point_3d) < 3:
             return False
 
-        x, y, z = point_3d
+        x, y, z = point_3d[0], point_3d[1], point_3d[2]
 
-        # 检查z坐标
-        if z < z_threshold:
-            return False
+        return (self.court_bounds['x_min'] <= x <= self.court_bounds['x_max'] and
+                self.court_bounds['y_min'] <= y <= self.court_bounds['y_max'] and
+                self.court_bounds['z_min'] <= z <= self.court_bounds['z_max'])
 
-        # 检查xy坐标是否在场地范围内
-        if court_boundary is None:
-            # 默认球场边界 (厘米)
-            court_boundary = [0, 0, 610, 1340]
+    def find_best_trajectory_for_prediction(self, current_time):
+        """找到最适合预测的轨迹片段 - 记录被排除的低质量点"""
+        if len(self.all_3d_points) < 5:
+            return None, None, 0.0
 
-        x_min, y_min, x_max, y_max = court_boundary
+        # 在寻找最佳轨迹之前，记录所有不符合质量要求的点
+        # 这里可以添加更复杂的质量评估逻辑
+        for i, (point, timestamp) in enumerate(zip(self.all_3d_points, self.all_timestamps)):
+            # 简单的质量检查示例
+            if i > 0:
+                prev_point = self.all_3d_points[i - 1]
+                prev_time = self.all_timestamps[i - 1]
 
-        return x_min <= x <= x_max and y_min <= y <= y_max
+                # 检查距离和时间间隔的合理性
+                distance = np.linalg.norm(point - prev_point)
+                time_diff = timestamp - prev_time
 
-    def get_recent_3d_points(self, time_window=0.5):
-        """获取最近时间窗口内的3D点"""
-        if not self.timestamps:
-            return [], []
+                if time_diff > 0:
+                    velocity = distance / time_diff
+                    # 如果速度异常高，标记为低质量点
+                    if velocity > 2000:  # 20m/s
+                        self.low_quality_points.append({
+                            'point_3d': point,
+                            'timestamp': timestamp,
+                            'reason': 'high_velocity',
+                            'velocity': velocity,
+                            'distance': distance,
+                            'time_diff': time_diff
+                        })
 
-        current_time = self.timestamps[-1]
-        recent_indices = [i for i, t in enumerate(self.timestamps)
-                          if current_time - t <= time_window]
+        best_points, best_timestamps, confidence = self.trajectory_manager.find_best_trajectory_segment(
+            self.all_3d_points, self.all_timestamps, current_time
+        )
 
-        recent_points = [self.points_3d[i] for i in recent_indices]
-        recent_timestamps = [self.timestamps[i] for i in recent_indices]
+        return best_points, best_timestamps, confidence
 
-        return recent_points, recent_timestamps
-
-    def filter_trajectory_by_court(self, trajectory1, timestamps1, trajectory2, timestamps2):
-        """
-        筛选出在目标场地上方的轨迹点
-
-        参数:
-            trajectory1: 相机1中的轨迹点列表
-            timestamps1: 相机1中的时间戳列表
-            trajectory2: 相机2中的轨迹点列表
-            timestamps2: 相机2中的时间戳列表
-
-        返回:
-            filtered_traj1: 相机1中筛选后的轨迹点
-            filtered_ts1: 相机1中筛选后的时间戳
-            filtered_traj2: 相机2中筛选后的轨迹点
-            filtered_ts2: 相机2中筛选后的时间戳
-        """
-        # 检查轨迹长度
-        if len(trajectory1) < 3 or len(trajectory2) < 3:
-            return trajectory1, timestamps1, trajectory2, timestamps2
-
-        # 为每个点对计算3D坐标
-        point_pairs = []  # [(idx1, idx2, point_3d), ...]
-
-        for i, ts1 in enumerate(timestamps1):
-            # 查找最近的时间戳
-            closest_ts2_idx = None
-            min_diff = 0.02  # 20ms阈值
-
-            for j, ts2 in enumerate(timestamps2):
-                diff = abs(ts1 - ts2)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_ts2_idx = j
-
-            if closest_ts2_idx is not None:
-                # 确保索引在有效范围内
-                if i < len(trajectory1) and closest_ts2_idx < len(trajectory2):
-                    # 三角测量
-                    point_3d = self.triangulate_point(trajectory1[i], trajectory2[closest_ts2_idx])
-
-                    if point_3d is not None:
-                        point_pairs.append((i, closest_ts2_idx, point_3d))
-
-        # 筛选出在场地上方的点对
-        valid_pairs = []
-
-        for idx1, idx2, point_3d in point_pairs:
-            if self.is_point_above_court(point_3d):
-                valid_pairs.append((idx1, idx2))
-
-        # 提取筛选后的轨迹点
-        if valid_pairs:
-            valid_idx1 = [pair[0] for pair in valid_pairs]
-            valid_idx2 = [pair[1] for pair in valid_pairs]
-
-            filtered_traj1 = [trajectory1[i] for i in valid_idx1]
-            filtered_ts1 = [timestamps1[i] for i in valid_idx1]
-            filtered_traj2 = [trajectory2[i] for i in valid_idx2]
-            filtered_ts2 = [timestamps2[i] for i in valid_idx2]
-
-            return filtered_traj1, filtered_ts1, filtered_traj2, filtered_ts2
-
-        # 如果没有有效点对，返回原始轨迹
-        return trajectory1, timestamps1, trajectory2, timestamps2
+    def get_debug_data(self):
+        """获取调试数据"""
+        return {
+            'all_valid_points': self.all_3d_points,
+            'all_timestamps': self.all_timestamps,
+            'rejected_points': self.rejected_points,
+            'low_quality_points': self.low_quality_points,
+            'triangulation_failed_points': self.triangulation_failed_points
+        }
 
     def reset(self):
         """重置处理器状态"""
-        self.points_3d = []
-        self.timestamps = []
+        self.all_3d_points = []
+        self.all_timestamps = []
+        self.rejected_points = []
+        self.low_quality_points = []
+        self.triangulation_failed_points = []
+        print("StereoProcessor reset")
