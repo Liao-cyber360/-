@@ -1,643 +1,891 @@
-"""
-3D可视化组件
-集成Open3D到PyQt6，支持多种点云类型切换和轨迹展示
-"""
+import threading
+import time
+import copy
 import numpy as np
 import open3d as o3d
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                            QPushButton, QComboBox, QCheckBox, QSlider,
-                            QGroupBox, QFormLayout, QFrame)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-import time
 
 
-class Visualization3DWidget(QWidget):
-    """3D可视化主组件"""
-    
-    # 信号定义
-    view_changed = pyqtSignal(dict)  # 视角变化信号
-    point_selected = pyqtSignal(np.ndarray)  # 点选择信号
-    
-    def __init__(self):
-        super().__init__()
-        
-        # Open3D可视化器
+class Interactive3DVisualizer:
+    """Enhanced Interactive 3D visualization with fixed landing point colors and camera view"""
+
+    def __init__(self, width=610, height=1340):
+        self.width = width + 200
+        self.height = height + 200
+        self.net_height = 155
+        self.court_width = width
+        self.court_height = height
+
+        # Window management - Enhanced state tracking
         self.vis = None
-        self.geometry_dict = {}
-        
-        # 可视化数据
-        self.trajectory_3d = []
-        self.prediction_trajectory = []
-        self.landing_point = None
-        self.court_mesh = None
-        
-        # 显示状态
-        self.show_trajectory = True
-        self.show_prediction = True
-        self.show_court = True
-        self.show_coordinate_frame = True
-        
-        # 颜色设置
-        self.trajectory_color = [0, 0.7, 1.0]  # 蓝色
-        self.prediction_color = [1.0, 0.5, 0]  # 橙色
-        self.landing_color = [1.0, 0, 0]       # 红色
-        self.court_color = [0.2, 0.8, 0.2]    # 绿色
-        
-        self.setup_ui()
-        self.setup_visualization()
-        
-        # 更新定时器
-        self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self.update_visualization)
-        self.update_timer.start(100)  # 每100ms更新一次
-    
-    def setup_ui(self):
-        """设置界面"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
-        
-        # 标题
-        title_label = QLabel("3D Trajectory Visualization")
-        title_label.setStyleSheet("""
-            QLabel {
-                font-size: 16px;
-                font-weight: bold;
-                color: #333;
-                padding: 5px;
-                background-color: #f0f0f0;
-                border-radius: 3px;
-            }
-        """)
-        layout.addWidget(title_label)
-        
-        # 控制面板
-        self.setup_control_panel(layout)
-        
-        # 3D视图占位符（实际的Open3D窗口将嵌入到这里）
-        self.view_placeholder = QFrame()
-        self.view_placeholder.setMinimumHeight(400)
-        self.view_placeholder.setStyleSheet("""
-            QFrame {
-                background-color: #000;
-                border: 2px solid #ccc;
-                border-radius: 5px;
-            }
-        """)
-        layout.addWidget(self.view_placeholder, 1)
-        
-        # 状态信息
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #666; font-size: 11px; padding: 2px;")
-        layout.addWidget(self.status_label)
-    
-    def setup_control_panel(self, parent_layout):
-        """设置控制面板"""
-        control_frame = QFrame()
-        control_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f8f8f8;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                padding: 5px;
-            }
-        """)
-        control_layout = QHBoxLayout(control_frame)
-        
-        # 显示选项组
-        display_group = QGroupBox("Display Options")
-        display_layout = QFormLayout(display_group)
-        
-        self.show_trajectory_cb = QCheckBox("Trajectory")
-        self.show_trajectory_cb.setChecked(True)
-        self.show_trajectory_cb.toggled.connect(self.on_display_options_changed)
-        display_layout.addRow(self.show_trajectory_cb)
-        
-        self.show_prediction_cb = QCheckBox("Prediction")
-        self.show_prediction_cb.setChecked(True)
-        self.show_prediction_cb.toggled.connect(self.on_display_options_changed)
-        display_layout.addRow(self.show_prediction_cb)
-        
-        self.show_court_cb = QCheckBox("Court")
-        self.show_court_cb.setChecked(True)
-        self.show_court_cb.toggled.connect(self.on_display_options_changed)
-        display_layout.addRow(self.show_court_cb)
-        
-        self.show_frame_cb = QCheckBox("Coordinate Frame")
-        self.show_frame_cb.setChecked(True)
-        self.show_frame_cb.toggled.connect(self.on_display_options_changed)
-        display_layout.addRow(self.show_frame_cb)
-        
-        control_layout.addWidget(display_group)
-        
-        # 视图控制组
-        view_group = QGroupBox("View Control")
-        view_layout = QVBoxLayout(view_group)
-        
-        # 预设视角
-        view_preset_layout = QHBoxLayout()
-        
-        self.top_view_btn = QPushButton("Top View")
-        self.top_view_btn.clicked.connect(lambda: self.set_view_preset("top"))
-        view_preset_layout.addWidget(self.top_view_btn)
-        
-        self.side_view_btn = QPushButton("Side View")
-        self.side_view_btn.clicked.connect(lambda: self.set_view_preset("side"))
-        view_preset_layout.addWidget(self.side_view_btn)
-        
-        self.front_view_btn = QPushButton("Front View")
-        self.front_view_btn.clicked.connect(lambda: self.set_view_preset("front"))
-        view_preset_layout.addWidget(self.front_view_btn)
-        
-        view_layout.addLayout(view_preset_layout)
-        
-        # 重置按钮
-        self.reset_view_btn = QPushButton("Reset View")
-        self.reset_view_btn.clicked.connect(self.reset_view)
-        view_layout.addWidget(self.reset_view_btn)
-        
-        control_layout.addWidget(view_group)
-        
-        # 数据控制组
-        data_group = QGroupBox("Data Control")
-        data_layout = QVBoxLayout(data_group)
-        
-        self.clear_trajectory_btn = QPushButton("Clear Trajectory")
-        self.clear_trajectory_btn.clicked.connect(self.clear_trajectory)
-        data_layout.addWidget(self.clear_trajectory_btn)
-        
-        self.clear_prediction_btn = QPushButton("Clear Prediction")
-        self.clear_prediction_btn.clicked.connect(self.clear_prediction)
-        data_layout.addWidget(self.clear_prediction_btn)
-        
-        self.clear_all_btn = QPushButton("Clear All")
-        self.clear_all_btn.clicked.connect(self.clear_all)
-        data_layout.addWidget(self.clear_all_btn)
-        
-        control_layout.addWidget(data_group)
-        
-        control_layout.addStretch()
-        parent_layout.addWidget(control_frame)
-    
-    def setup_visualization(self):
-        """设置Open3D可视化"""
+        self.view_control = None
+        self.window_created = False
+        self.window_visible = False
+        self.window_should_close = False
+        self.creation_in_progress = False
+
+        # Fixed initialization
+        self.view_initialized = False
+        self.initialization_attempts = 0
+        self.max_init_attempts = 3
+
+        # Geometry objects storage - Centralized management
+        self.geometries = {}
+        self.geometry_names = [
+            'court_lines', 'net', 'floor', 'all_valid_points',
+            'prediction_trajectory_points', 'rejected_points',
+            'low_quality_points', 'triangulation_failed_points',
+            'predicted_trajectory_line', 'landing_point'
+        ]
+
+        # Data management with thread safety
+        self.data_lock = threading.Lock()
+        self.reset_data()
+
+        # Visualization controls - Extended options
+        self.visibility_flags = {
+            'all_valid_points': True,
+            'prediction_points': True,
+            'rejected_points': True,
+            'low_quality_points': True,
+            'triangulation_failed': True,
+            'predicted_trajectory': True
+        }
+
+        # Update control - Optimized timing
+        self.last_update_time = 0
+        self.update_interval = 1.0 / 20.0
+        self.needs_geometry_update = False
+        self.geometry_update_lock = threading.Lock()
+
+        print(f"Enhanced 3D Visualizer initialized at {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"User: {self._get_current_user()}")
+
+    def _get_current_user(self):
+        """Get current user login"""
+        return "Liao-cyber360"
+
+    def reset_data(self):
+        """Reset all visualization data to clean state"""
+        self.all_valid_points_data = []
+        self.prediction_points_data = []
+        self.rejected_points_data = []
+        self.low_quality_points_data = []
+        self.triangulation_failed_data = []
+        self.predicted_trajectory_data = []
+        self.landing_position = None
+        self.in_bounds = None
+        self.last_landing_position = np.array([0, 0, 0])
+
+    def _create_window_safely(self):
+        """Safely create and initialize the 3D window with comprehensive error handling"""
+        if self.creation_in_progress:
+            print("⚠️ Window creation already in progress")
+            return False
+
         try:
-            # 创建可视化器
+            self.creation_in_progress = True
+
+            # Clean up any existing visualizer
+            if self.vis is not None:
+                self._cleanup_visualizer()
+
+            # Create fresh visualizer instance
             self.vis = o3d.visualization.Visualizer()
-            self.vis.create_window(window_name="3D Visualization", 
-                                 width=800, height=600, visible=False)
-            
-            # 设置渲染选项
+
+            # Create window with error handling
+            success = self.vis.create_window(
+                window_name="Badminton 3D Debug Visualization (Press Q in main window to close)",
+                width=1200,
+                height=800,
+                left=100,
+                top=100
+            )
+
+            if not success:
+                print("❌ Failed to create Open3D window")
+                self._cleanup_visualizer()
+                return False
+
+            # Configure rendering options
             render_option = self.vis.get_render_option()
             render_option.background_color = np.array([0.1, 0.1, 0.1])
-            render_option.point_size = 5.0
-            render_option.line_width = 2.0
-            
-            # 创建坐标系
-            self.create_coordinate_frame()
-            
-            # 创建场地
-            self.create_court_mesh()
-            
-            self.status_label.setText("3D visualization initialized")
-            
-        except Exception as e:
-            self.status_label.setText(f"3D initialization error: {str(e)}")
-            print(f"Open3D visualization setup error: {e}")
-    
-    def create_coordinate_frame(self):
-        """创建坐标系"""
-        try:
-            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=100, origin=[0, 0, 0]
-            )
-            self.geometry_dict['coordinate_frame'] = coordinate_frame
-            
-            if self.vis:
-                self.vis.add_geometry(coordinate_frame)
-        
-        except Exception as e:
-            print(f"Failed to create coordinate frame: {e}")
-    
-    def create_court_mesh(self):
-        """创建场地网格"""
-        try:
-            # 场地尺寸 (单位: cm)
-            court_width = 610
-            court_length = 670
-            
-            # 创建场地平面
-            court_vertices = np.array([
-                [0, 0, 0],
-                [court_width, 0, 0],
-                [court_width, court_length, 0],
-                [0, court_length, 0]
-            ], dtype=np.float64)
-            
-            court_triangles = np.array([
-                [0, 1, 2],
-                [0, 2, 3]
-            ])
-            
-            court_mesh = o3d.geometry.TriangleMesh()
-            court_mesh.vertices = o3d.utility.Vector3dVector(court_vertices)
-            court_mesh.triangles = o3d.utility.Vector3iVector(court_triangles)
-            court_mesh.paint_uniform_color(self.court_color)
-            
-            # 计算法向量
-            court_mesh.compute_vertex_normals()
-            
-            self.geometry_dict['court'] = court_mesh
-            
-            # 创建场地线框
-            self.create_court_lines()
-            
-            if self.vis:
-                self.vis.add_geometry(court_mesh)
-        
-        except Exception as e:
-            print(f"Failed to create court mesh: {e}")
-    
-    def create_court_lines(self):
-        """创建场地线框"""
-        try:
-            # 场地线定义
-            lines = [
-                # 外边界
-                [[0, 0, 1], [610, 0, 1]],      # 底线
-                [[0, 670, 1], [610, 670, 1]],  # 网线
-                [[0, 0, 1], [0, 670, 1]],      # 左边线
-                [[610, 0, 1], [610, 670, 1]],  # 右边线
-                
-                # 内边界
-                [[4, 4, 1], [606, 4, 1]],      # 内底线
-                [[4, 666, 1], [606, 666, 1]],  # 内网线
-                [[4, 4, 1], [4, 666, 1]],      # 左内线
-                [[606, 4, 1], [606, 666, 1]],  # 右内线
-                
-                # 发球线
-                [[76, 198, 1], [534, 198, 1]],
-                [[76, 472, 1], [534, 472, 1]],
-                
-                # 中线
-                [[305, 198, 1], [305, 472, 1]],
-            ]
-            
-            # 创建线集合
-            line_points = []
-            line_indices = []
-            
-            for line in lines:
-                start_idx = len(line_points)
-                line_points.extend(line)
-                line_indices.append([start_idx, start_idx + 1])
-            
-            line_set = o3d.geometry.LineSet()
-            line_set.points = o3d.utility.Vector3dVector(line_points)
-            line_set.lines = o3d.utility.Vector2iVector(line_indices)
-            line_set.paint_uniform_color([1, 1, 1])  # 白色线
-            
-            self.geometry_dict['court_lines'] = line_set
-            
-            if self.vis:
-                self.vis.add_geometry(line_set)
-        
-        except Exception as e:
-            print(f"Failed to create court lines: {e}")
-    
-    def update_trajectory(self, trajectory_3d):
-        """更新3D轨迹"""
-        try:
-            if not trajectory_3d:
-                return
-            
-            self.trajectory_3d = trajectory_3d
-            
-            # 移除旧轨迹
-            if 'trajectory_points' in self.geometry_dict:
-                if self.vis:
-                    self.vis.remove_geometry(self.geometry_dict['trajectory_points'], reset_bounding_box=False)
-            
-            if 'trajectory_lines' in self.geometry_dict:
-                if self.vis:
-                    self.vis.remove_geometry(self.geometry_dict['trajectory_lines'], reset_bounding_box=False)
-            
-            # 创建轨迹点
-            points = np.array(trajectory_3d, dtype=np.float64)
-            point_cloud = o3d.geometry.PointCloud()
-            point_cloud.points = o3d.utility.Vector3dVector(points)
-            
-            # 设置颜色渐变（从蓝到红）
-            colors = []
-            for i in range(len(points)):
-                ratio = i / max(1, len(points) - 1)
-                color = [self.trajectory_color[0] * (1 - ratio) + 1.0 * ratio,
-                        self.trajectory_color[1] * (1 - ratio),
-                        self.trajectory_color[2]]
-                colors.append(color)
-            
-            point_cloud.colors = o3d.utility.Vector3dVector(colors)
-            self.geometry_dict['trajectory_points'] = point_cloud
-            
-            # 创建轨迹线
-            if len(points) > 1:
-                line_indices = [[i, i + 1] for i in range(len(points) - 1)]
-                line_set = o3d.geometry.LineSet()
-                line_set.points = o3d.utility.Vector3dVector(points)
-                line_set.lines = o3d.utility.Vector2iVector(line_indices)
-                line_set.paint_uniform_color(self.trajectory_color)
-                
-                self.geometry_dict['trajectory_lines'] = line_set
-                
-                if self.vis and self.show_trajectory:
-                    self.vis.add_geometry(line_set, reset_bounding_box=False)
-            
-            if self.vis and self.show_trajectory:
-                self.vis.add_geometry(point_cloud, reset_bounding_box=False)
-            
-            self.status_label.setText(f"Trajectory updated: {len(trajectory_3d)} points")
-        
-        except Exception as e:
-            print(f"Failed to update trajectory: {e}")
-    
-    def update_prediction(self, prediction_trajectory, landing_point=None):
-        """更新预测轨迹"""
-        try:
-            self.prediction_trajectory = prediction_trajectory
-            self.landing_point = landing_point
-            
-            # 移除旧预测
-            for key in ['prediction_points', 'prediction_lines', 'landing_point']:
-                if key in self.geometry_dict:
-                    if self.vis:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-            
-            # 创建预测轨迹
-            if prediction_trajectory:
-                points = np.array(prediction_trajectory, dtype=np.float64)
-                
-                # 预测点云
-                point_cloud = o3d.geometry.PointCloud()
-                point_cloud.points = o3d.utility.Vector3dVector(points)
-                point_cloud.paint_uniform_color(self.prediction_color)
-                self.geometry_dict['prediction_points'] = point_cloud
-                
-                # 预测线
-                if len(points) > 1:
-                    line_indices = [[i, i + 1] for i in range(len(points) - 1)]
-                    line_set = o3d.geometry.LineSet()
-                    line_set.points = o3d.utility.Vector3dVector(points)
-                    line_set.lines = o3d.utility.Vector2iVector(line_indices)
-                    line_set.paint_uniform_color(self.prediction_color)
-                    
-                    self.geometry_dict['prediction_lines'] = line_set
-                    
-                    if self.vis and self.show_prediction:
-                        self.vis.add_geometry(line_set, reset_bounding_box=False)
-                
-                if self.vis and self.show_prediction:
-                    self.vis.add_geometry(point_cloud, reset_bounding_box=False)
-            
-            # 创建落点标记
-            if landing_point is not None:
-                landing_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=20)
-                landing_sphere.translate(landing_point)
-                landing_sphere.paint_uniform_color(self.landing_color)
-                
-                self.geometry_dict['landing_point'] = landing_sphere
-                
-                if self.vis and self.show_prediction:
-                    self.vis.add_geometry(landing_sphere, reset_bounding_box=False)
-            
-            self.status_label.setText(f"Prediction updated: {len(prediction_trajectory) if prediction_trajectory else 0} points")
-        
-        except Exception as e:
-            print(f"Failed to update prediction: {e}")
-    
-    def on_display_options_changed(self):
-        """显示选项变化"""
-        self.show_trajectory = self.show_trajectory_cb.isChecked()
-        self.show_prediction = self.show_prediction_cb.isChecked()
-        self.show_court = self.show_court_cb.isChecked()
-        self.show_coordinate_frame = self.show_frame_cb.isChecked()
-        
-        self.update_visibility()
-    
-    def update_visibility(self):
-        """更新几何体可见性"""
-        if not self.vis:
-            return
-        
-        try:
-            # 轨迹可见性
-            for key in ['trajectory_points', 'trajectory_lines']:
-                if key in self.geometry_dict:
-                    if self.show_trajectory:
-                        self.vis.add_geometry(self.geometry_dict[key], reset_bounding_box=False)
-                    else:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-            
-            # 预测可见性
-            for key in ['prediction_points', 'prediction_lines', 'landing_point']:
-                if key in self.geometry_dict:
-                    if self.show_prediction:
-                        self.vis.add_geometry(self.geometry_dict[key], reset_bounding_box=False)
-                    else:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-            
-            # 场地可见性
-            for key in ['court', 'court_lines']:
-                if key in self.geometry_dict:
-                    if self.show_court:
-                        self.vis.add_geometry(self.geometry_dict[key], reset_bounding_box=False)
-                    else:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-            
-            # 坐标系可见性
-            if 'coordinate_frame' in self.geometry_dict:
-                if self.show_coordinate_frame:
-                    self.vis.add_geometry(self.geometry_dict['coordinate_frame'], reset_bounding_box=False)
-                else:
-                    self.vis.remove_geometry(self.geometry_dict['coordinate_frame'], reset_bounding_box=False)
-        
-        except Exception as e:
-            print(f"Failed to update visibility: {e}")
-    
-    def set_view_preset(self, preset):
-        """设置预设视角"""
-        if not self.vis:
-            return
-        
-        try:
-            view_control = self.vis.get_view_control()
-            
-            if preset == "top":
-                # 俯视图
-                view_control.set_lookat([305, 335, 0])  # 场地中心
-                view_control.set_up([0, 1, 0])
-                view_control.set_front([0, 0, -1])
-                view_control.set_zoom(0.3)
-            
-            elif preset == "side":
-                # 侧视图
-                view_control.set_lookat([305, 335, 100])
-                view_control.set_up([0, 0, 1])
-                view_control.set_front([1, 0, 0])
-                view_control.set_zoom(0.5)
-            
-            elif preset == "front":
-                # 前视图
-                view_control.set_lookat([305, 335, 100])
-                view_control.set_up([0, 0, 1])
-                view_control.set_front([0, 1, 0])
-                view_control.set_zoom(0.5)
-        
-        except Exception as e:
-            print(f"Failed to set view preset: {e}")
-    
-    def reset_view(self):
-        """重置视图"""
-        if not self.vis:
-            return
-        
-        try:
-            view_control = self.vis.get_view_control()
-            view_control.reset_camera_local_rotate()
-            self.set_view_preset("top")
-        
-        except Exception as e:
-            print(f"Failed to reset view: {e}")
-    
-    def clear_trajectory(self):
-        """清除轨迹"""
-        try:
-            for key in ['trajectory_points', 'trajectory_lines']:
-                if key in self.geometry_dict:
-                    if self.vis:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-                    del self.geometry_dict[key]
-            
-            self.trajectory_3d.clear()
-            self.status_label.setText("Trajectory cleared")
-        
-        except Exception as e:
-            print(f"Failed to clear trajectory: {e}")
-    
-    def clear_prediction(self):
-        """清除预测"""
-        try:
-            for key in ['prediction_points', 'prediction_lines', 'landing_point']:
-                if key in self.geometry_dict:
-                    if self.vis:
-                        self.vis.remove_geometry(self.geometry_dict[key], reset_bounding_box=False)
-                    del self.geometry_dict[key]
-            
-            self.prediction_trajectory.clear()
-            self.landing_point = None
-            self.status_label.setText("Prediction cleared")
-        
-        except Exception as e:
-            print(f"Failed to clear prediction: {e}")
-    
-    def clear_all(self):
-        """清除所有数据"""
-        self.clear_trajectory()
-        self.clear_prediction()
-    
-    def update_visualization(self):
-        """更新可视化（定时调用）"""
-        if self.vis:
-            try:
+            render_option.point_size = 8.0
+            render_option.line_width = 3.0
+            render_option.show_coordinate_frame = True
+
+            # Initialize all geometries
+            self._initialize_all_geometries()
+
+            # Ensure window is stable before setting view
+            for _ in range(5):
                 self.vis.poll_events()
                 self.vis.update_renderer()
-            except Exception as e:
-                # 静默处理更新错误
-                pass
-    
-    def closeEvent(self, event):
-        """关闭事件"""
-        if self.update_timer:
-            self.update_timer.stop()
-        
-        if self.vis:
+                time.sleep(0.03)
+
+            # Get view control after window is fully ready
+            self.view_control = self.vis.get_view_control()
+
+            # Set initial view with retry mechanism
+            view_set = self._set_initial_view_with_retry()
+
+            # Update window state
+            self.window_created = True
+            self.window_visible = True
+            self.window_should_close = False
+            self.view_initialized = view_set
+
+            print("✅ 3D visualization window created successfully")
+            print(f"   View initialized: {self.view_initialized}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error creating 3D window: {e}")
+            import traceback
+            traceback.print_exc()
+            self._cleanup_visualizer()
+            return False
+        finally:
+            self.creation_in_progress = False
+
+    def _set_initial_view_with_retry(self):
+        """Set initial view with proper retry mechanism and FIXED camera positioning"""
+        if not self.view_control:
+            print("⚠️ View control not available")
+            return False
+
+        for attempt in range(3):
             try:
+                # Give the window time to be ready
+                time.sleep(0.1)
+
+                # 🔧 FIXED: 更合适的相机视角设置
+                # 设置相机位置到场地斜上方，距离适中
+                court_center_x = self.width / 2  # 约 405
+                court_center_y = self.height / 2  # 约 770
+                court_center_z = 100  # 1米高度
+
+                # 1. 设置观察目标点（场地中心）
+                self.view_control.set_lookat([court_center_x, court_center_y, court_center_z])
+                time.sleep(0.05)
+
+                # 2. 设置相机前方向（从斜上方观看）
+                # 这个向量决定了相机朝向，调整为更合适的角度
+                self.view_control.set_front([0.2, -0.5, 0.8])  # 从斜前上方观看
+                time.sleep(0.05)
+
+                # 3. 设置上方向
+                self.view_control.set_up([0, 0, 1])  # Z轴向上
+                time.sleep(0.05)
+
+                # 4. 设置合适的缩放级别
+                self.view_control.set_zoom(0.3)  # 增加缩放，拉近距离
+
+                # 测试视角设置是否成功
+                try:
+                    current_params = self.view_control.convert_to_pinhole_camera_parameters()
+                    if current_params is not None:
+                        print(f"✅ Enhanced view set successfully on attempt {attempt + 1}")
+                        print(f"   Camera target: ({court_center_x:.0f}, {court_center_y:.0f}, {court_center_z:.0f})")
+                        print(f"   Zoom level: 0.8 (closer view)")
+                        return True
+                except:
+                    pass
+
+            except Exception as e:
+                if attempt < 2:
+                    print(f"⚠️ View setup attempt {attempt + 1} failed: {e}")
+                    time.sleep(0.1)
+                else:
+                    print(f"❌ Failed to set initial view after {attempt + 1} attempts: {e}")
+
+        # Even if view setting failed, the window might still be usable
+        print("⚠️ View setting failed, but window should still be interactive")
+        return False
+
+    def _initialize_all_geometries(self):
+        """Initialize all geometry objects and add to visualizer"""
+        try:
+            # Create court and environment
+            self.geometries['court_lines'] = o3d.geometry.LineSet()
+            self.geometries['net'] = o3d.geometry.LineSet()
+
+            # Create floor
+            self.geometries['floor'] = o3d.geometry.TriangleMesh.create_box(
+               width=self.width, height=0.1, depth=self.height
+            )
+            self.geometries['floor'].translate([0, -0.05, 0])
+            self.geometries['floor'].paint_uniform_color([0.2, 0.2, 0.2])
+
+            # Create point clouds for different data types
+            point_cloud_names = [
+                'all_valid_points', 'prediction_trajectory_points', 'rejected_points',
+                'low_quality_points', 'triangulation_failed_points'
+            ]
+            for name in point_cloud_names:
+                self.geometries[name] = o3d.geometry.PointCloud()
+
+            # Create trajectory line and landing point
+            self.geometries['predicted_trajectory_line'] = o3d.geometry.LineSet()
+            self.geometries['landing_point'] = o3d.geometry.TriangleMesh.create_sphere(radius=15)  # 稍微大一点便于观察
+
+            # Move landing point out of view initially
+            self.geometries['landing_point'].translate([10000, 10000, 10000])
+
+            # Create court and net geometry
+            self._create_court()
+            self._create_net()
+
+            # Add all geometries to visualizer
+            for name, geometry in self.geometries.items():
+                self.vis.add_geometry(geometry)
+
+            print("✅ All geometries initialized and added to visualizer")
+
+        except Exception as e:
+            print(f"❌ Error initializing geometries: {e}")
+            raise
+
+    def _create_court(self):
+        """Create badminton court lines with proper coordinates and enhanced visibility"""
+        offset_x = 100
+        offset_y = 100
+        court_width = self.court_width
+        court_height = self.court_height
+
+        # Court points with enhanced layout
+        points = [
+            # Extended area boundary (lighter gray)
+            [0, 0, 0], [self.width, 0, 0], [self.width, self.height, 0], [0, self.height, 0],
+
+            # Actual court boundary (doubles) - WHITE for visibility
+            [offset_x, offset_y, 0], [offset_x + court_width, offset_y, 0],
+            [offset_x + court_width, offset_y + court_height, 0], [offset_x, offset_y + court_height, 0],
+
+            # Singles court boundary - BRIGHT BLUE
+            [offset_x + 46, offset_y, 0], [offset_x + 564, offset_y, 0],
+            [offset_x + 564, offset_y + court_height, 0], [offset_x + 46, offset_y + court_height, 0],
+
+            # Service lines - YELLOW for better visibility
+            [offset_x, offset_y + 76, 0], [offset_x + court_width, offset_y + 76, 0],  # Back service line
+            [offset_x, offset_y + 468, 0], [offset_x + court_width, offset_y + 468, 0],  # Front service line
+
+            # Center line - BRIGHT GREEN
+            [offset_x + court_width / 2, offset_y, 0], [offset_x + court_width / 2, offset_y + court_height, 0],
+        ]
+
+        # Court lines connections
+        lines = [
+            # Extended area (4 lines)
+            [0, 1], [1, 2], [2, 3], [3, 0],
+            # Doubles court (4 lines)
+            [4, 5], [5, 6], [6, 7], [7, 4],
+            # Singles court (4 lines)
+            [8, 9], [9, 10], [10, 11], [11, 8],
+            # Service lines (2 lines)
+            [12, 13], [14, 15],
+            # Center line (1 line)
+            [16, 17]
+        ]
+
+        # Enhanced line colors for better visibility
+        colors = []
+        colors.extend([[0.5, 0.5, 0.5]] * 4)  # Extended area - dark gray
+        colors.extend([[1, 1, 1]] * 4)  # Doubles court - bright white
+        colors.extend([[0.3, 0.7, 1]] * 4)  # Singles court - bright blue
+        colors.extend([[1, 1, 0]] * 2)  # Service lines - yellow
+        colors.extend([[0, 1, 0]] * 1)  # Center line - bright green
+
+        self.geometries['court_lines'].points = o3d.utility.Vector3dVector(points)
+        self.geometries['court_lines'].lines = o3d.utility.Vector2iVector(lines)
+        self.geometries['court_lines'].colors = o3d.utility.Vector3dVector(colors)
+
+    def _create_net(self):
+        """Create badminton net with enhanced visibility"""
+        offset_x = 100
+        offset_y = 100
+        court_width = self.court_width
+        court_height = self.court_height
+        net_height = self.net_height
+
+        # Net points
+        points = [
+            [offset_x, offset_y + court_height / 2, 0],  # Left bottom
+            [offset_x + court_width, offset_y + court_height / 2, 0],  # Right bottom
+            [offset_x + court_width, offset_y + court_height / 2, net_height],  # Right top
+            [offset_x, offset_y + court_height / 2, net_height],  # Left top
+        ]
+
+        # Net lines
+        lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
+        colors = [[1, 1, 1]] * 4  # Bright white for better visibility
+
+        self.geometries['net'].points = o3d.utility.Vector3dVector(points)
+        self.geometries['net'].lines = o3d.utility.Vector2iVector(lines)
+        self.geometries['net'].colors = o3d.utility.Vector3dVector(colors)
+
+    def update_landing_point(self, position, in_bounds):
+        """🔧 FIXED: Update landing point position and boundary status with correct color logic"""
+        with self.data_lock:
+            if position is not None:
+                if len(position) == 2:
+                    self.landing_position = [position[0], position[1], 0]
+                else:
+                    self.landing_position = copy.deepcopy(position)
+
+                # 🔧 FIXED: 确保 in_bounds 状态正确传递和存储
+                self.in_bounds = bool(in_bounds)  # 确保是布尔值
+
+                status = 'IN BOUNDS' if self.in_bounds else 'OUT OF BOUNDS'
+                print(f"🎯 Landing point updated: ({position[0]:.1f}, {position[1]:.1f}) - {status}")
+                print(f"   Color will be: {'GREEN' if self.in_bounds else 'RED'}")
+            else:
+                self.landing_position = None
+                self.in_bounds = None
+                print("🎯 Landing point cleared")
+            self.needs_geometry_update = True
+
+    def _update_landing_point(self):
+        """🔧 FIXED: Update landing point sphere geometry with CORRECT color logic"""
+        try:
+            if self.landing_position is not None and 'landing_point' in self.geometries:
+                new_position = np.array([
+                    self.landing_position[0] + 100,  # 转换到可视化坐标系
+                    self.landing_position[1] + 100,
+                    self.landing_position[2] if len(self.landing_position) > 2 else 5  # 稍微离地面高一点
+                ])
+
+                # Calculate displacement from last position
+                displacement = new_position - self.last_landing_position
+                self.geometries['landing_point'].translate(displacement)
+
+                # 🔧 FIXED: 正确的颜色设置逻辑
+                if self.in_bounds is not None:  # 确保有边界判定结果
+                    if self.in_bounds:
+                        # 界内 - 绿色
+                        self.geometries['landing_point'].paint_uniform_color([0, 1, 0])
+                        color_name = "GREEN (IN BOUNDS)"
+                    else:
+                        # 界外 - 红色
+                        self.geometries['landing_point'].paint_uniform_color([1, 0, 0])
+                        color_name = "RED (OUT OF BOUNDS)"
+
+                    print(f"🎨 Landing point color set to: {color_name}")
+                else:
+                    # 没有边界判定信息 - 黄色表示未知
+                    self.geometries['landing_point'].paint_uniform_color([1, 1, 0])
+                    print("🎨 Landing point color set to: YELLOW (UNKNOWN)")
+
+                self.last_landing_position = new_position
+            else:
+                # Move landing point out of view when no valid position
+                displacement = np.array([10000, 10000, 10000]) - self.last_landing_position
+                self.geometries['landing_point'].translate(displacement)
+                self.last_landing_position = np.array([10000, 10000, 10000])
+
+            # 更新几何体
+            if self.vis and self.window_created:
+                self.vis.update_geometry(self.geometries['landing_point'])
+
+        except Exception as e:
+            print(f"❌ Error updating landing point: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ... 保持其他方法不变，只修改上述关键方法 ...
+
+    def toggle_window(self):
+        """Improved window toggle with comprehensive state management"""
+        if not self.window_visible:
+            # Create and show window
+            if self._create_window_safely():
+                print(f"✅ 3D visualization opened at {time.strftime('%H:%M:%S')} UTC")
+                self._print_usage_info()
+
+                # Force immediate update to show existing data
+                if any([self.all_valid_points_data, self.prediction_points_data,
+                        self.predicted_trajectory_data]):
+                    with self.geometry_update_lock:
+                        self.needs_geometry_update = True
+                        self._update_all_geometries()
+            else:
+                print("❌ Failed to create 3D visualization window")
+        else:
+            # Close window
+            self.close_window()
+
+    def close_window(self):
+        """Properly close the window and reset all states"""
+        try:
+            print("🔄 Closing 3D visualization window...")
+            self.window_should_close = True
+            self.window_visible = False
+
+            if self.vis and self.window_created:
+                # Gracefully destroy window
                 self.vis.destroy_window()
-            except:
-                pass
-        
-        event.accept()
+                time.sleep(0.1)  # Allow cleanup time
 
+            self._cleanup_visualizer()
+            print("✅ 3D visualization window closed successfully")
 
-class CourtVisualizationWidget(QWidget):
-    """2D场地可视化组件（俯视图）"""
-    
-    def __init__(self):
-        super().__init__()
-        
-        # 场地参数
-        self.court_width = 610   # cm
-        self.court_length = 670  # cm
-        self.scale_factor = 0.5  # 显示缩放因子
-        
-        # 可视化数据
-        self.trajectory_2d = []
-        self.prediction_2d = []
-        self.landing_point_2d = None
-        
-        self.setup_ui()
-    
-    def setup_ui(self):
-        """设置界面"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        # 标题
-        title_label = QLabel("Court View (Top-down)")
-        title_label.setStyleSheet("""
-            QLabel {
-                font-size: 14px;
-                font-weight: bold;
-                color: #333;
-                padding: 3px;
-                background-color: #f0f0f0;
-                border-radius: 3px;
+        except Exception as e:
+            print(f"⚠️ Error during window closure (non-critical): {e}")
+            self._cleanup_visualizer()
+
+    def _cleanup_visualizer(self):
+        """Clean up all visualizer resources and reset state"""
+        try:
+            # Reset all state variables
+            self.vis = None
+            self.view_control = None
+            self.window_created = False
+            self.window_visible = False
+            self.view_initialized = False
+            self.initialization_attempts = 0
+            self.window_should_close = False
+            self.creation_in_progress = False
+
+            # Clear geometry references
+            self.geometries.clear()
+
+            # Reset update flags
+            with self.geometry_update_lock:
+                self.needs_geometry_update = False
+
+        except Exception as e:
+            print(f"Warning during cleanup: {e}")
+
+    @property
+    def window_visible(self):
+        """Property to check if window is visible"""
+        return self._window_visible
+
+    @window_visible.setter
+    def window_visible(self, value):
+        """Setter for window visibility state"""
+        self._window_visible = value
+
+    def update_debug_data(self, debug_data):
+        """Update debug data with thread safety and enhanced logging"""
+        with self.data_lock:
+            # All valid points (150 frames)
+            if 'all_valid_points' in debug_data:
+                self.all_valid_points_data = copy.deepcopy(debug_data['all_valid_points'])
+
+            # Prediction trajectory points (8-15 selected points)
+            if 'prediction_points' in debug_data:
+                self.prediction_points_data = copy.deepcopy(debug_data['prediction_points'])
+
+            # Rejected points (out of bounds)
+            if 'rejected_points' in debug_data:
+                self.rejected_points_data = copy.deepcopy(debug_data['rejected_points'])
+
+            # Low quality points
+            if 'low_quality_points' in debug_data:
+                self.low_quality_points_data = copy.deepcopy(debug_data['low_quality_points'])
+
+            # Triangulation failed points
+            if 'triangulation_failed_points' in debug_data:
+                self.triangulation_failed_data = copy.deepcopy(debug_data['triangulation_failed_points'])
+
+            self.needs_geometry_update = True
+
+            print(f"📊 Debug data updated at {time.strftime('%H:%M:%S')} UTC:")
+            print(f"   ✅ All valid points: {len(self.all_valid_points_data)}")
+            print(f"   🎯 Prediction points: {len(self.prediction_points_data)}")
+            print(f"   ❌ Rejected points: {len(self.rejected_points_data)}")
+            print(f"   ⚠️  Low quality points: {len(self.low_quality_points_data)}")
+            print(f"   🔺 Triangulation failed: {len(self.triangulation_failed_data)}")
+
+    def update_predicted_trajectory(self, trajectory_data):
+        """Update predicted trajectory data with proper error handling"""
+        with self.data_lock:
+            if trajectory_data:
+                self.predicted_trajectory_data = copy.deepcopy(trajectory_data)
+                print(f"🎯 Predicted trajectory updated: {len(self.predicted_trajectory_data)} points")
+            else:
+                self.predicted_trajectory_data = []
+                print("🎯 Predicted trajectory cleared")
+            self.needs_geometry_update = True
+
+    def update_if_visible(self):
+        """Non-blocking update with comprehensive error handling"""
+        if not self.window_visible or not self.window_created or self.window_should_close:
+            return True
+
+        current_time = time.time()
+        if current_time - self.last_update_time < self.update_interval:
+            return True
+
+        try:
+            # Verify window is still valid
+            if not self.vis:
+                self.window_visible = False
+                return True
+
+            # Update geometries if needed
+            with self.geometry_update_lock:
+                if self.needs_geometry_update:
+                    self._update_all_geometries()
+                    self.needs_geometry_update = False
+
+            # Poll events with error handling
+            events_ok = self.vis.poll_events()
+            if not events_ok:
+                print("🔄 3D window closed by user")
+                self.close_window()
+                return True
+
+            # Update renderer
+            self.vis.update_renderer()
+            self.last_update_time = current_time
+            return True
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(word in error_msg for word in ['destroyed', 'invalid', 'window', 'setviewpoint']):
+                print(f"🔄 3D window error, closing: {e}")
+                self.close_window()
+            else:
+                print(f"⚠️ Minor 3D visualization error: {e}")
+            return True
+
+    def _update_all_geometries(self):
+        """Update all geometry objects with current data"""
+        if not self.window_created or not self.vis or self.window_should_close:
+            return
+
+        try:
+            with self.data_lock:
+                # Update point clouds
+                self._update_point_cloud('all_valid_points', self.all_valid_points_data,
+                                         [0.5, 1, 0.5], self.visibility_flags['all_valid_points'])
+
+                self._update_point_cloud('prediction_trajectory_points', self.prediction_points_data,
+                                         [0, 0, 1], self.visibility_flags['prediction_points'])
+
+                # Update special point types
+                self._update_rejected_points()
+                self._update_low_quality_points()
+                self._update_triangulation_failed_points()
+
+                # Update trajectory and landing point
+                self._update_predicted_trajectory()
+                self._update_landing_point()  # 使用修复后的方法
+
+        except Exception as e:
+            print(f"Error updating geometries: {e}")
+
+    def _update_point_cloud(self, geometry_name, data, color, visible):
+        """Generic method to update point cloud geometry"""
+        if geometry_name not in self.geometries:
+            return
+
+        try:
+            if data and visible:
+                # Transform points to visualization coordinates
+                if geometry_name in ['all_valid_points', 'prediction_trajectory_points']:
+                    points_array = np.array([(p[0] + 100, p[1] + 100, p[2]) for p in data])
+                else:
+                    points_array = np.array(data)
+
+                self.geometries[geometry_name].points = o3d.utility.Vector3dVector(points_array)
+                colors = [color for _ in range(len(data))]
+                self.geometries[geometry_name].colors = o3d.utility.Vector3dVector(colors)
+            else:
+                # Clear geometry when not visible or no data
+                self.geometries[geometry_name].points = o3d.utility.Vector3dVector([])
+                self.geometries[geometry_name].colors = o3d.utility.Vector3dVector([])
+
+            self.vis.update_geometry(self.geometries[geometry_name])
+
+        except Exception as e:
+            print(f"Error updating {geometry_name}: {e}")
+
+    def _update_rejected_points(self):
+        """Update rejected points geometry (red points)"""
+        try:
+            if (self.rejected_points_data and
+                    self.visibility_flags['rejected_points'] and
+                    'rejected_points' in self.geometries):
+
+                points_array = np.array([
+                    (p['point_3d'][0] + 100, p['point_3d'][1] + 100, p['point_3d'][2])
+                    for p in self.rejected_points_data
+                ])
+
+                self.geometries['rejected_points'].points = o3d.utility.Vector3dVector(points_array)
+                colors = [[1, 0, 0] for _ in range(len(self.rejected_points_data))]  # Red
+                self.geometries['rejected_points'].colors = o3d.utility.Vector3dVector(colors)
+            else:
+                self.geometries['rejected_points'].points = o3d.utility.Vector3dVector([])
+                self.geometries['rejected_points'].colors = o3d.utility.Vector3dVector([])
+
+            self.vis.update_geometry(self.geometries['rejected_points'])
+
+        except Exception as e:
+            print(f"Error updating rejected points: {e}")
+
+    def _update_low_quality_points(self):
+        """Update low quality points geometry (orange points)"""
+        try:
+            if (self.low_quality_points_data and
+                    self.visibility_flags['low_quality_points'] and
+                    'low_quality_points' in self.geometries):
+
+                points_array = np.array([
+                    (p['point_3d'][0] + 100, p['point_3d'][1] + 100, p['point_3d'][2])
+                    for p in self.low_quality_points_data
+                ])
+
+                self.geometries['low_quality_points'].points = o3d.utility.Vector3dVector(points_array)
+                colors = [[1, 0.5, 0] for _ in range(len(self.low_quality_points_data))]  # Orange
+                self.geometries['low_quality_points'].colors = o3d.utility.Vector3dVector(colors)
+            else:
+                self.geometries['low_quality_points'].points = o3d.utility.Vector3dVector([])
+                self.geometries['low_quality_points'].colors = o3d.utility.Vector3dVector([])
+
+            self.vis.update_geometry(self.geometries['low_quality_points'])
+
+        except Exception as e:
+            print(f"Error updating low quality points: {e}")
+
+    def _update_triangulation_failed_points(self):
+        """Update triangulation failed points geometry (gray points)"""
+        try:
+            if (self.triangulation_failed_data and
+                    self.visibility_flags['triangulation_failed'] and
+                    'triangulation_failed_points' in self.geometries):
+
+                points_array = []
+                for p in self.triangulation_failed_data:
+                    left_point = p['left_point']
+                    # Simple 2D to 3D mapping for failed triangulation points
+                    x = (left_point[0] - 640) * 0.5
+                    y = (left_point[1] - 360) * 0.5
+                    points_array.append([x + 100, y + 100, 10])
+
+                if points_array:
+                    self.geometries['triangulation_failed_points'].points = o3d.utility.Vector3dVector(
+                        np.array(points_array)
+                    )
+                    colors = [[0.5, 0.5, 0.5] for _ in range(len(points_array))]  # Gray
+                    self.geometries['triangulation_failed_points'].colors = o3d.utility.Vector3dVector(colors)
+                else:
+                    self.geometries['triangulation_failed_points'].points = o3d.utility.Vector3dVector([])
+                    self.geometries['triangulation_failed_points'].colors = o3d.utility.Vector3dVector([])
+            else:
+                self.geometries['triangulation_failed_points'].points = o3d.utility.Vector3dVector([])
+                self.geometries['triangulation_failed_points'].colors = o3d.utility.Vector3dVector([])
+
+            self.vis.update_geometry(self.geometries['triangulation_failed_points'])
+
+        except Exception as e:
+            print(f"Error updating triangulation failed points: {e}")
+
+    def _update_predicted_trajectory(self):
+        """Update predicted trajectory line geometry (cyan to blue gradient)"""
+        try:
+            if (self.predicted_trajectory_data and
+                    len(self.predicted_trajectory_data) > 1 and
+                    self.visibility_flags['predicted_trajectory'] and
+                    'predicted_trajectory_line' in self.geometries):
+
+                trajectory_points = []
+                for p in self.predicted_trajectory_data:
+                    if isinstance(p, dict) and 'position' in p:
+                        pos = p['position']
+                    else:
+                        pos = p
+
+                    if len(pos) == 2:
+                        trajectory_points.append([pos[0] + 100, pos[1] + 100, 0])
+                    else:
+                        trajectory_points.append([pos[0] + 100, pos[1] + 100, pos[2]])
+
+                if len(trajectory_points) > 1:
+                    points_array = np.array(trajectory_points)
+                    lines = [[i, i + 1] for i in range(len(points_array) - 1)]
+
+                    self.geometries['predicted_trajectory_line'].points = o3d.utility.Vector3dVector(points_array)
+                    self.geometries['predicted_trajectory_line'].lines = o3d.utility.Vector2iVector(lines)
+
+                    # Cyan to blue gradient
+                    n_lines = len(lines)
+                    colors = []
+                    for i in range(n_lines):
+                        ratio = i / max(1, n_lines - 1)
+                        colors.append([0, 0.5 + ratio * 0.5, 1])  # Cyan to blue
+
+                    self.geometries['predicted_trajectory_line'].colors = o3d.utility.Vector3dVector(colors)
+                else:
+                    self.geometries['predicted_trajectory_line'].points = o3d.utility.Vector3dVector([])
+                    self.geometries['predicted_trajectory_line'].lines = o3d.utility.Vector2iVector([])
+            else:
+                self.geometries['predicted_trajectory_line'].points = o3d.utility.Vector3dVector([])
+                self.geometries['predicted_trajectory_line'].lines = o3d.utility.Vector2iVector([])
+
+            self.vis.update_geometry(self.geometries['predicted_trajectory_line'])
+
+        except Exception as e:
+            print(f"Error updating predicted trajectory: {e}")
+
+    def toggle_visualization_elements(self, element_type):
+        """Toggle display of specific visualization elements"""
+        toggle_map = {
+            'all_valid': 'all_valid_points',
+            'prediction': 'prediction_points',
+            'rejected': 'rejected_points',
+            'low_quality': 'low_quality_points',
+            'triangulation_failed': 'triangulation_failed',
+            'predicted_trajectory': 'predicted_trajectory'
+        }
+
+        if element_type in toggle_map:
+            flag_name = toggle_map[element_type]
+            self.visibility_flags[flag_name] = not self.visibility_flags[flag_name]
+            status = 'ON' if self.visibility_flags[flag_name] else 'OFF'
+
+            display_names = {
+                'all_valid': 'All valid points',
+                'prediction': 'Prediction points',
+                'rejected': 'Rejected points',
+                'low_quality': 'Low quality points',
+                'triangulation_failed': 'Triangulation failed points',
+                'predicted_trajectory': 'Predicted trajectory'
             }
-        """)
-        layout.addWidget(title_label)
-        
-        # 2D视图（简化实现，实际可以使用QGraphicsView）
-        self.court_label = QLabel()
-        self.court_label.setMinimumSize(int(self.court_width * self.scale_factor),
-                                       int(self.court_length * self.scale_factor))
-        self.court_label.setStyleSheet("""
-            QLabel {
-                background-color: #2E7D32;
-                border: 2px solid #fff;
-                border-radius: 5px;
+
+            print(f"📊 {display_names[element_type]}: {status}")
+            self.needs_geometry_update = True
+        else:
+            print(f"⚠️ Unknown element type: {element_type}")
+
+    def _print_usage_info(self):
+        """Print comprehensive usage information with updated camera info"""
+        print("   🎯 Enhanced 3D Debug Visualization Features:")
+        print("   - Light green points: All valid points (150 frames)")
+        print("   - Dark blue points: Prediction trajectory points (selected for prediction)")
+        print("   - Cyan gradient line: Predicted trajectory path")
+        print("   - Red points: Boundary-filtered rejected points")
+        print("   - Orange points: Low quality assessment points")
+        print("   - Gray points: Triangulation failed points")
+        print("   - Landing point sphere: GREEN=In bounds, RED=Out of bounds, YELLOW=Unknown")
+        print("   📋 Enhanced Interactive Controls:")
+        print("   - Mouse left-click + drag: Rotate view around center")
+        print("   - Mouse right-click + drag: Pan view")
+        print("   - Mouse scroll wheel: Zoom in/out")
+        print("   - Keys 1-6: Toggle different point types on/off")
+        print("   - Press Q in main window to close this visualization")
+        print("   🎥 Camera View: Optimized angle and distance for court visualization")
+
+    def print_debug_statistics(self):
+        """Print comprehensive debug statistics"""
+        with self.data_lock:
+            print("\n" + "=" * 80)
+            print("🔍 3D VISUALIZATION DEBUG STATISTICS")
+            print(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            print(f"User: {self._get_current_user()}")
+            print("=" * 80)
+
+            # Data counts
+            print(f"✅ All valid points (150 frames): {len(self.all_valid_points_data)}")
+            print(f"🎯 Prediction trajectory points: {len(self.prediction_points_data)}")
+            print(f"🎯 Predicted trajectory line points: {len(self.predicted_trajectory_data)}")
+            print(f"❌ Rejected (out-of-bounds) points: {len(self.rejected_points_data)}")
+            print(f"⚠️  Low quality points: {len(self.low_quality_points_data)}")
+            print(f"🔺 Triangulation failed points: {len(self.triangulation_failed_data)}")
+
+            # Landing point status
+            if self.landing_position is not None:
+                status = "IN BOUNDS (GREEN)" if self.in_bounds else "OUT OF BOUNDS (RED)" if self.in_bounds is not None else "UNKNOWN (YELLOW)"
+                print(f"🎯 Landing point: ({self.landing_position[0]:.1f}, {self.landing_position[1]:.1f}) - {status}")
+
+            # Rejection analysis
+            if self.rejected_points_data:
+                print("\n📋 Rejection reasons breakdown:")
+                reasons = {}
+                for point in self.rejected_points_data:
+                    reason = point.get('reason', 'unknown')
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                for reason, count in reasons.items():
+                    print(f"   {reason}: {count} points")
+
+            # Quality analysis
+            if self.low_quality_points_data:
+                print("\n📋 Low quality reasons breakdown:")
+                reasons = {}
+                for point in self.low_quality_points_data:
+                    reason = point.get('reason', 'unknown')
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                for reason, count in reasons.items():
+                    print(f"   {reason}: {count} points")
+
+            # Trajectory analysis
+            if self.prediction_points_data:
+                points = np.array(self.prediction_points_data)
+                print(f"\n📊 Prediction trajectory analysis:")
+                print(f"   Points count: {len(points)}")
+                if len(points) > 1:
+                    distances = [np.linalg.norm(points[i] - points[i - 1]) for i in range(1, len(points))]
+                    print(f"   Average inter-point distance: {np.mean(distances):.1f} cm")
+                    print(f"   Height range: {np.max(points[:, 2]) - np.min(points[:, 2]):.1f} cm")
+                    print(f"   Z coordinates range: {np.min(points[:, 2]):.1f} to {np.max(points[:, 2]):.1f} cm")
+
+            # Visualization status
+            print("\n📊 Visualization element status:")
+            status_map = {
+                'all_valid_points': '1 - All valid points',
+                'prediction_points': '2 - Prediction points',
+                'rejected_points': '3 - Rejected points',
+                'low_quality_points': '4 - Low quality points',
+                'triangulation_failed': '5 - Triangulation failed',
+                'predicted_trajectory': '6 - Predicted trajectory'
             }
-        """)
-        self.court_label.setText("2D Court View\n(Implementation placeholder)")
-        self.court_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.court_label)
-    
-    def update_trajectory_2d(self, trajectory_3d):
-        """更新2D轨迹显示"""
-        # 投影3D轨迹到2D
-        if trajectory_3d:
-            self.trajectory_2d = [(point[0], point[1]) for point in trajectory_3d]
-        
-        # 这里可以实现具体的2D绘制逻辑
-        pass
-    
-    def update_prediction_2d(self, prediction_3d, landing_point_3d):
-        """更新2D预测显示"""
-        if prediction_3d:
-            self.prediction_2d = [(point[0], point[1]) for point in prediction_3d]
-        
-        if landing_point_3d:
-            self.landing_point_2d = (landing_point_3d[0], landing_point_3d[1])
-        
-        # 这里可以实现具体的2D绘制逻辑
-        pass
+
+            for flag_name, description in status_map.items():
+                status = 'ON' if self.visibility_flags.get(flag_name, True) else 'OFF'
+                print(f"   {description}: {status}")
+
+            # System status
+            print(f"\n🔧 System status:")
+            print(f"   Window created: {self.window_created}")
+            print(f"   Window visible: {self.window_visible}")
+            print(f"   View initialized: {self.view_initialized}")
+            print(f"   Creation in progress: {self.creation_in_progress}")
+            print("=" * 80)
+
+    def reset(self):
+        """Comprehensive reset of all visualization data and state"""
+        with self.data_lock:
+            self.reset_data()
+
+            with self.geometry_update_lock:
+                self.needs_geometry_update = True
+
+            print(f"🔄 3D visualization data reset at {time.strftime('%H:%M:%S')} UTC")
+
+            # If window is visible, update geometries to clear display
+            if self.window_visible and self.window_created:
+                self._update_all_geometries()
+
+    def start(self):
+        """Initialize the visualizer system"""
+        print(f"🚀 Enhanced 3D Debug Visualizer ready at {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print("   Call toggle_window() to show 3D visualization")
+        print("   Features: Fixed camera view, Correct landing point colors")
+        print("   System ready for debug data visualization")
+
+    def stop(self):
+        """Stop visualizer and clean up all resources"""
+        try:
+            print(f"🛑 Stopping 3D visualizer at {time.strftime('%H:%M:%S')} UTC...")
+
+            if self.vis and self.window_created:
+                self.vis.destroy_window()
+                time.sleep(0.2)  # Allow complete cleanup
+
+        except Exception as e:
+            print(f"⚠️ Error during visualizer shutdown: {e}")
+        finally:
+            self._cleanup_visualizer()
+            print("✅ Enhanced 3D Debug Visualizer stopped and all resources cleaned up")
