@@ -17,8 +17,14 @@ class TrajectoryPredictor:
         # 预测结果
         self.last_prediction = None
         self.last_prediction_time = 0
+        
+        # 速度追踪
+        self.velocity_history = []  # 存储历史速度
+        self.max_velocity = 0.0     # 最大速度
+        self.max_velocity_position = None  # 最大速度时的位置
+        self.max_velocity_time = 0.0  # 最大速度时的时间
 
-        print("TrajectoryPredictor initialized with compatibility fixes")
+        print("TrajectoryPredictor initialized with compatibility fixes and velocity tracking")
 
     def predict_landing_point(self, trajectory_points, timestamps):
         """预测羽毛球落地点"""
@@ -54,14 +60,22 @@ class TrajectoryPredictor:
                                                                                                     cleaned_times)
 
             if landing_position is not None:
+                # 计算速度分析
+                velocity_analysis = self.get_velocity_analysis(cleaned_points, cleaned_times)
+                
                 self.last_prediction = {
                     'position': landing_position,
                     'time': landing_time,
-                    'trajectory': predicted_trajectory
+                    'trajectory': predicted_trajectory,
+                    'velocity_analysis': velocity_analysis,
+                    'max_velocity_info': self.get_max_velocity_before_landing()
                 }
                 self.last_prediction_time = time.time()
 
                 print(f"Prediction successful: landing at ({landing_position[0]:.1f}, {landing_position[1]:.1f})")
+                print(f"Max velocity: {velocity_analysis['max_speed_ms']:.1f} m/s ({velocity_analysis['max_speed_ms']*3.6:.1f} km/h)")
+                print(f"Average velocity: {velocity_analysis['avg_speed_ms']:.1f} m/s")
+                
                 return landing_position, landing_time, predicted_trajectory
             else:
                 print("Physics model prediction failed")
@@ -383,6 +397,131 @@ class TrajectoryPredictor:
             import traceback
             traceback.print_exc()
             return None, None, None
+    
+    def calculate_velocities(self, points, timestamps):
+        """
+        计算轨迹中每个点的速度
+        
+        Args:
+            points: 3D轨迹点数组
+            timestamps: 对应的时间戳数组
+            
+        Returns:
+            tuple: (velocities, speeds, max_speed_info)
+        """
+        if len(points) < 2 or len(timestamps) < 2:
+            return [], [], None
+        
+        velocities = []
+        speeds = []
+        max_speed = 0.0
+        max_speed_info = None
+        
+        # 清空历史记录
+        self.velocity_history = []
+        self.max_velocity = 0.0
+        
+        for i in range(1, len(points)):
+            dt = timestamps[i] - timestamps[i-1]
+            if dt > 0:
+                # 计算位移向量
+                displacement = np.array(points[i]) - np.array(points[i-1])
+                
+                # 计算速度向量 (cm/s)
+                velocity_vector = displacement / dt
+                velocities.append(velocity_vector)
+                
+                # 计算速度大小
+                speed = np.linalg.norm(velocity_vector)
+                speeds.append(speed)
+                
+                # 记录历史
+                velocity_data = {
+                    'position': points[i],
+                    'timestamp': timestamps[i],
+                    'velocity_vector': velocity_vector,
+                    'speed': speed
+                }
+                self.velocity_history.append(velocity_data)
+                
+                # 跟踪最大速度
+                if speed > max_speed:
+                    max_speed = speed
+                    max_speed_info = {
+                        'speed': speed,
+                        'position': points[i],
+                        'timestamp': timestamps[i],
+                        'velocity_vector': velocity_vector,
+                        'index': i
+                    }
+                    
+                    # 更新实例变量
+                    self.max_velocity = speed
+                    self.max_velocity_position = points[i]
+                    self.max_velocity_time = timestamps[i]
+            else:
+                # 时间间隔为0，使用前一个速度
+                if velocities:
+                    velocities.append(velocities[-1])
+                    speeds.append(speeds[-1])
+                else:
+                    velocities.append(np.zeros(3))
+                    speeds.append(0.0)
+        
+        return velocities, speeds, max_speed_info
+    
+    def get_velocity_analysis(self, points, timestamps):
+        """
+        获取详细的速度分析
+        
+        Returns:
+            dict: 包含各种速度统计信息
+        """
+        velocities, speeds, max_speed_info = self.calculate_velocities(points, timestamps)
+        
+        if not speeds:
+            return {
+                'max_speed': 0.0,
+                'avg_speed': 0.0,
+                'min_speed': 0.0,
+                'speed_std': 0.0,
+                'max_speed_info': None,
+                'velocity_history': []
+            }
+        
+        analysis = {
+            'max_speed': max(speeds),
+            'avg_speed': np.mean(speeds),
+            'min_speed': min(speeds),
+            'speed_std': np.std(speeds),
+            'max_speed_info': max_speed_info,
+            'velocity_history': self.velocity_history,
+            'speed_profile': speeds,
+            'total_distance': sum(np.linalg.norm(points[i+1] - points[i]) for i in range(len(points)-1)),
+            'flight_time': timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+        }
+        
+        # 转换单位为更友好的显示
+        analysis['max_speed_ms'] = analysis['max_speed'] / 100  # m/s
+        analysis['avg_speed_ms'] = analysis['avg_speed'] / 100  # m/s
+        analysis['total_distance_m'] = analysis['total_distance'] / 100  # m
+        
+        return analysis
+    
+    def get_max_velocity_before_landing(self):
+        """
+        获取落地前的最大速度信息
+        
+        Returns:
+            dict: 最大速度相关信息
+        """
+        return {
+            'max_velocity': self.max_velocity,
+            'max_velocity_ms': self.max_velocity / 100,  # m/s
+            'max_velocity_kmh': self.max_velocity * 0.036,  # km/h
+            'max_velocity_position': self.max_velocity_position,
+            'max_velocity_time': self.max_velocity_time
+        }
 
 
 class CourtBoundaryAnalyzer:

@@ -1,10 +1,13 @@
 """
 视频处理线程
-负责视频帧读取和缓冲
+负责视频帧读取和缓冲，支持MJPEG网络摄像头
 """
 import cv2
 import time
 import numpy as np
+import requests
+import threading
+from datetime import datetime
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 from collections import deque
 
@@ -314,6 +317,247 @@ class DualVideoWorker(QThread):
         """跳转"""
         self.worker1.seek(frame_number)
         self.worker2.seek(frame_number)
+
+
+class MJPEGCameraWorker(QThread):
+    """MJPEG网络摄像头工作线程"""
+    
+    # 信号定义
+    frame_ready = pyqtSignal(int, np.ndarray, float, str)  # (camera_id, frame, timestamp, timestamp_str)
+    error_occurred = pyqtSignal(str)
+    status_changed = pyqtSignal(int, str)  # (camera_id, status)
+    
+    def __init__(self, camera_id=0, camera_url="", timestamp_header="X-Timestamp"):
+        super().__init__()
+        
+        self.camera_id = camera_id
+        self.camera_url = camera_url
+        self.timestamp_header = timestamp_header
+        
+        # 状态控制
+        self.is_running = False
+        self.is_paused = False
+        
+        # 缓冲设置
+        self.frame_buffer = deque(maxlen=150)  # 5秒 * 30fps = 150帧
+        self.buffer_duration = 5.0  # 5秒缓冲
+        
+        # 性能统计
+        self.frame_count = 0
+        self.last_time = datetime.now()
+        self.fps = 0
+        self.last_timestamp = ""
+        
+        # 线程同步
+        self.mutex = QMutex()
+        self.condition = QWaitCondition()
+    
+    def update_frame_stats(self, headers):
+        """更新帧统计信息"""
+        self.frame_count += 1
+
+        # 计算实时FPS（每秒更新）
+        current_time = datetime.now()
+        if (current_time - self.last_time).total_seconds() >= 1:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.last_time = current_time
+
+        # 解析时间戳
+        ts_str = headers.get(self.timestamp_header, "")
+        if ts_str and ts_str.isdigit():
+            ts_ms = int(ts_str)
+            self.last_timestamp = datetime.fromtimestamp(ts_ms / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        else:
+            self.last_timestamp = current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    def run(self):
+        """主线程循环"""
+        self.is_running = True
+        self.status_changed.emit(self.camera_id, "Connecting...")
+        
+        try:
+            # 创建MJPEG流连接
+            response = requests.get(self.camera_url, stream=True, timeout=10)
+            response.raise_for_status()
+            
+            self.status_changed.emit(self.camera_id, "Connected")
+            
+            # 解析MJPEG流
+            bytes_buffer = b''
+            
+            while self.is_running:
+                self.mutex.lock()
+                
+                # 检查是否暂停
+                if self.is_paused:
+                    self.condition.wait(self.mutex)
+                    self.mutex.unlock()
+                    continue
+                
+                self.mutex.unlock()
+                
+                try:
+                    # 读取数据块
+                    chunk = response.raw.read(1024)
+                    if not chunk:
+                        break
+                    
+                    bytes_buffer += chunk
+                    
+                    # 查找JPEG边界
+                    jpeg_start = bytes_buffer.find(b'\xff\xd8')
+                    jpeg_end = bytes_buffer.find(b'\xff\xd9')
+                    
+                    if jpeg_start != -1 and jpeg_end != -1 and jpeg_end > jpeg_start:
+                        # 提取JPEG数据
+                        jpeg_data = bytes_buffer[jpeg_start:jpeg_end + 2]
+                        bytes_buffer = bytes_buffer[jpeg_end + 2:]
+                        
+                        # 解码图像
+                        nparr = np.frombuffer(jpeg_data, np.uint8)
+                        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        
+                        if frame is not None:
+                            timestamp = time.time()
+                            
+                            # 更新统计信息
+                            self.update_frame_stats(response.headers)
+                            
+                            # 添加到缓冲区
+                            self.frame_buffer.append({
+                                'frame': frame.copy(),
+                                'timestamp': timestamp,
+                                'timestamp_str': self.last_timestamp
+                            })
+                            
+                            # 发送帧数据
+                            self.frame_ready.emit(self.camera_id, frame, timestamp, self.last_timestamp)
+                    
+                except Exception as e:
+                    if self.is_running:
+                        self.error_occurred.emit(f"MJPEG Camera {self.camera_id} frame error: {str(e)}")
+                        break
+            
+        except Exception as e:
+            self.error_occurred.emit(f"MJPEG Camera {self.camera_id} connection error: {str(e)}")
+            self.status_changed.emit(self.camera_id, "Error")
+        
+        finally:
+            self.status_changed.emit(self.camera_id, "Disconnected")
+    
+    def stop(self):
+        """停止录制"""
+        self.is_running = False
+        self.condition.wakeAll()
+    
+    def pause(self):
+        """暂停"""
+        self.mutex.lock()
+        self.is_paused = True
+        self.mutex.unlock()
+        self.status_changed.emit(self.camera_id, "Paused")
+    
+    def resume(self):
+        """恢复"""
+        self.mutex.lock()
+        self.is_paused = False
+        self.condition.wakeAll()
+        self.mutex.unlock()
+        self.status_changed.emit(self.camera_id, "Connected")
+    
+    def get_buffered_frames(self):
+        """获取缓冲的帧数据（用于暂停后处理）"""
+        return list(self.frame_buffer)
+    
+    def clear_buffer(self):
+        """清空缓冲区"""
+        self.frame_buffer.clear()
+
+
+class DualMJPEGWorker(QThread):
+    """双路MJPEG摄像头工作线程"""
+    
+    # 信号定义
+    dual_frame_ready = pyqtSignal(int, int, np.ndarray, np.ndarray, float)  # (cam1_id, cam2_id, frame1, frame2, timestamp)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, camera1_url="", camera2_url="", timestamp_header="X-Timestamp"):
+        super().__init__()
+        
+        self.worker1 = MJPEGCameraWorker(0, camera1_url, timestamp_header)
+        self.worker2 = MJPEGCameraWorker(1, camera2_url, timestamp_header)
+        
+        # 帧同步
+        self.frame1_queue = deque(maxlen=30)
+        self.frame2_queue = deque(maxlen=30)
+        self.sync_tolerance = 0.05  # 50ms同步容差
+        
+        # 连接信号
+        self.worker1.frame_ready.connect(self.on_frame1_ready)
+        self.worker2.frame_ready.connect(self.on_frame2_ready)
+        self.worker1.error_occurred.connect(self.error_occurred.emit)
+        self.worker2.error_occurred.connect(self.error_occurred.emit)
+    
+    def on_frame1_ready(self, camera_id, frame, timestamp, timestamp_str):
+        """相机1帧就绪"""
+        self.frame1_queue.append({'frame': frame, 'timestamp': timestamp})
+        self.try_sync_frames()
+    
+    def on_frame2_ready(self, camera_id, frame, timestamp, timestamp_str):
+        """相机2帧就绪"""
+        self.frame2_queue.append({'frame': frame, 'timestamp': timestamp})
+        self.try_sync_frames()
+    
+    def try_sync_frames(self):
+        """尝试同步帧"""
+        if not self.frame1_queue or not self.frame2_queue:
+            return
+        
+        # 简单的时间戳匹配
+        frame1_data = self.frame1_queue[0]
+        frame2_data = self.frame2_queue[0]
+        
+        time_diff = abs(frame1_data['timestamp'] - frame2_data['timestamp'])
+        
+        if time_diff <= self.sync_tolerance:
+            # 时间戳匹配，发送同步帧
+            self.dual_frame_ready.emit(
+                0, 1,
+                frame1_data['frame'],
+                frame2_data['frame'],
+                max(frame1_data['timestamp'], frame2_data['timestamp'])
+            )
+            self.frame1_queue.popleft()
+            self.frame2_queue.popleft()
+        elif frame1_data['timestamp'] < frame2_data['timestamp']:
+            # 相机1帧太早，丢弃
+            self.frame1_queue.popleft()
+        else:
+            # 相机2帧太早，丢弃
+            self.frame2_queue.popleft()
+    
+    def start_processing(self):
+        """开始处理"""
+        self.worker1.start()
+        self.worker2.start()
+    
+    def stop_processing(self):
+        """停止处理"""
+        self.worker1.stop()
+        self.worker2.stop()
+        self.worker1.wait(3000)
+        self.worker2.wait(3000)
+    
+    def pause(self):
+        """暂停"""
+        self.worker1.pause()
+        self.worker2.pause()
+    
+    def resume(self):
+        """恢复"""
+        self.worker1.resume()
+        self.worker2.resume()
     
     def on_frame1_ready(self, camera_id, frame, timestamp):
         """相机1帧就绪"""
